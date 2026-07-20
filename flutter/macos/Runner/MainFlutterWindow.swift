@@ -74,7 +74,7 @@ private final class NativeTrackpadMonitor {
     func register(view: NSView?, channel: FlutterMethodChannel) {
         guard let view = view else { return }
         pruneClosedWindows()
-        view.acceptsTouchEvents = true
+        view.allowedTouchTypes = [.indirect]
         view.wantsRestingTouches = true
 
         let registerWindow = { [weak self, weak view] in

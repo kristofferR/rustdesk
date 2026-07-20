@@ -1031,6 +1031,9 @@ pub fn handle_pointer_(evt: &PointerDeviceEvent, conn: i32) {
             _ => {}
         },
         Some(TrackpadEvent(evt)) => {
+            #[cfg(not(target_os = "linux"))]
+            let _ = evt;
+
             #[cfg(target_os = "linux")]
             {
                 use crate::ipc::{DataTrackpadEvent, DataTrackpadPhase, DataTrackpadTouch};

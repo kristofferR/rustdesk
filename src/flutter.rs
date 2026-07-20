@@ -700,7 +700,8 @@ impl InvokeUiSession for FlutterHandler {
     }
 
     /// unused in flutter, use switch_display or set_peer_info
-    fn set_display(&self, _x: i32, _y: i32, _w: i32, _h: i32, _cursor_embedded: bool, _scale: f64) {}
+    fn set_display(&self, _x: i32, _y: i32, _w: i32, _h: i32, _cursor_embedded: bool, _scale: f64) {
+    }
 
     fn update_privacy_mode(&self) {
         self.push_event::<&str>("update_privacy_mode", &[], &[]);
@@ -1938,6 +1939,38 @@ fn session_send_touch_event(
     }
 }
 
+#[inline]
+fn session_send_trackpad_event(
+    session_id: SessionID,
+    v: &serde_json::Value,
+    alt: bool,
+    ctrl: bool,
+    shift: bool,
+    command: bool,
+) {
+    let Some(phase) = v.get("t").and_then(|phase| phase.as_str()) else {
+        return;
+    };
+    let Some(values) = v.get("v").and_then(|touches| touches.as_array()) else {
+        return;
+    };
+    let touches = values
+        .iter()
+        .take(5)
+        .filter_map(|value| {
+            Some(TrackpadTouch {
+                id: value.get("id")?.as_u64()?.try_into().ok()?,
+                x: value.get("x")?.as_i64()?.try_into().ok()?,
+                y: value.get("y")?.as_i64()?.try_into().ok()?,
+                ..Default::default()
+            })
+        })
+        .collect();
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.send_trackpad_event(phase, touches, alt, ctrl, shift, command);
+    }
+}
+
 pub fn session_send_pointer(session_id: SessionID, msg: String) {
     if let Ok(m) = serde_json::from_str::<HashMap<String, serde_json::Value>>(&msg) {
         let alt = m.get("alt").is_some();
@@ -1947,6 +1980,9 @@ pub fn session_send_pointer(session_id: SessionID, msg: String) {
         match (m.get("k"), m.get("v")) {
             (Some(k), Some(v)) => match k.as_str() {
                 Some("touch") => session_send_touch_event(session_id, v, alt, ctrl, shift, command),
+                Some("trackpad") => {
+                    session_send_trackpad_event(session_id, v, alt, ctrl, shift, command)
+                }
                 _ => {}
             },
             _ => {}

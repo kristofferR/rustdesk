@@ -53,6 +53,7 @@ class RelativeMouseModel {
   // with a different session.
   static RelativeMouseModel? _activeNativeModel;
   static bool _hostChannelInitialized = false;
+  static void Function(Map<dynamic, dynamic>)? onTrackpadTouches;
 
   /// Initialize the host channel for native relative mouse mode.
   /// This should be called once when the app starts on macOS.
@@ -68,9 +69,25 @@ class RelativeMouseModel {
         final dx = args['dx'] as int;
         final dy = args['dy'] as int;
         _activeNativeModel?._onNativeMouseDelta(dx, dy);
+      } else if (call.method == 'onTrackpadTouches') {
+        final args = call.arguments as Map<dynamic, dynamic>;
+        onTrackpadTouches?.call(args);
       }
       return null;
     });
+  }
+
+  static Future<bool> setNativeTrackpadForwarding(bool enabled) async {
+    if (!isMacOS) return false;
+    initHostChannel();
+    try {
+      return await _hostChannel!.invokeMethod<bool>(
+              'setNativeTrackpadForwarding', {'enabled': enabled}) ??
+          false;
+    } catch (e) {
+      debugPrint('[Trackpad] Failed to set native forwarding: $e');
+      return false;
+    }
   }
 
   // TODO(perf): Consider routing native delta through RelativeMouseAccumulator/throttle

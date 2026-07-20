@@ -2734,6 +2734,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "evdev"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25b686663ba7f08d92880ff6ba22170f1df4e83629341cba34cf82cd65ebea99"
+dependencies = [
+ "bitvec",
+ "cfg-if 1.0.0",
+ "libc",
+ "nix 0.29.0",
+]
+
+[[package]]
 name = "event-listener"
 version = "2.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7298,7 +7310,8 @@ dependencies = [
  "docopt",
  "enigo",
  "errno",
- "evdev",
+ "evdev 0.11.5",
+ "evdev 0.13.2",
  "flutter_rust_bridge",
  "fon",
  "fontdb",

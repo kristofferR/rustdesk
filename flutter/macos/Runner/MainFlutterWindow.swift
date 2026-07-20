@@ -35,6 +35,131 @@ class RelativeMouseState {
     private init() {}
 }
 
+private final class NativeTrackpadWindowState {
+    weak var window: NSWindow?
+    let channel: FlutterMethodChannel
+    var forwardingEnabled = false
+    var gestureActive = false
+    var touchIDs: [ObjectIdentifier: Int] = [:]
+    var nextTouchID = 1
+
+    init(window: NSWindow, channel: FlutterMethodChannel) {
+        self.window = window
+        self.channel = channel
+    }
+
+    func reset() {
+        gestureActive = false
+        touchIDs.removeAll(keepingCapacity: true)
+        nextTouchID = 1
+    }
+}
+
+/// Captures public AppKit indirect-touch snapshots without consuming ordinary
+/// mouse or two-finger scrolling. Three-or-more-finger sequences are consumed
+/// only while the pointer is inside a remote desktop canvas.
+private final class NativeTrackpadMonitor {
+    static let shared = NativeTrackpadMonitor()
+
+    private var states: [Int: NativeTrackpadWindowState] = [:]
+    private var eventMonitor: Any?
+
+    private init() {
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.gesture]) {
+            [weak self] event in
+            return self?.handle(event) ?? event
+        }
+    }
+
+    func register(view: NSView?, channel: FlutterMethodChannel) {
+        guard let view = view else { return }
+        pruneClosedWindows()
+        view.acceptsTouchEvents = true
+        view.wantsRestingTouches = true
+
+        let registerWindow = { [weak self, weak view] in
+            guard let self = self, let window = view?.window else { return }
+            self.states[window.windowNumber] = NativeTrackpadWindowState(
+                window: window,
+                channel: channel)
+        }
+        if view.window == nil {
+            DispatchQueue.main.async(execute: registerWindow)
+        } else {
+            registerWindow()
+        }
+    }
+
+    func setForwarding(_ enabled: Bool, for window: NSWindow?) {
+        guard let window = window,
+              let state = states[window.windowNumber] else { return }
+        if !enabled && state.gestureActive {
+            send(phase: "cancel", touches: [], state: state)
+            state.reset()
+        }
+        state.forwardingEnabled = enabled
+    }
+
+    private func send(
+        phase: String,
+        touches: [[String: Any]],
+        state: NativeTrackpadWindowState
+    ) {
+        state.channel.invokeMethod(
+            "onTrackpadTouches",
+            arguments: ["phase": phase, "touches": touches])
+    }
+
+    private func handle(_ event: NSEvent) -> NSEvent? {
+        pruneClosedWindows()
+        guard let window = event.window,
+              let state = states[window.windowNumber],
+              state.forwardingEnabled else { return event }
+
+        let touching = event.touches(matching: .touching, in: nil)
+        let wasActive = state.gestureActive
+
+        if touching.count >= 3 {
+            var contacts: [[String: Any]] = []
+            contacts.reserveCapacity(min(touching.count, 5))
+            for touch in touching.prefix(5) {
+                let identity = ObjectIdentifier(touch.identity as AnyObject)
+                let id: Int
+                if let existing = state.touchIDs[identity] {
+                    id = existing
+                } else {
+                    id = state.nextTouchID
+                    state.nextTouchID += 1
+                    state.touchIDs[identity] = id
+                }
+                let position = touch.normalizedPosition
+                contacts.append([
+                    "id": id,
+                    "x": Int((position.x * 10_000).rounded()),
+                    // AppKit's normalized Y axis points up; evdev points down.
+                    "y": Int(((1.0 - position.y) * 10_000).rounded()),
+                ])
+            }
+            contacts.sort { ($0["id"] as? Int ?? 0) < ($1["id"] as? Int ?? 0) }
+            state.gestureActive = true
+            send(phase: wasActive ? "update" : "begin", touches: contacts, state: state)
+            return nil
+        }
+
+        if wasActive {
+            let cancelled = !event.touches(matching: .cancelled, in: nil).isEmpty
+            send(phase: cancelled ? "cancel" : "end", touches: [], state: state)
+            state.reset()
+            return nil
+        }
+        return event
+    }
+
+    private func pruneClosedWindows() {
+        states = states.filter { $0.value.window != nil }
+    }
+}
+
 class MainFlutterWindow: NSWindow {
     override func awakeFromNib() {
         rustdesk_core_main();
@@ -180,6 +305,8 @@ class MainFlutterWindow: NSWindow {
 
     public func setMethodHandler(registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "org.rustdesk.rustdesk/host", binaryMessenger: registrar.messenger)
+        let registrarView = registrar.view
+        NativeTrackpadMonitor.shared.register(view: registrarView, channel: channel)
         channel.setMethodCallHandler({
             (call, result) -> Void in
                 switch call.method {
@@ -276,6 +403,14 @@ class MainFlutterWindow: NSWindow {
 
                 case "disableNativeRelativeMouseMode":
                     self.disableNativeRelativeMouseMode()
+                    result(true)
+
+                case "setNativeTrackpadForwarding":
+                    let arg = call.arguments as? [String: Any]
+                    let enabled = arg?["enabled"] as? Bool ?? false
+                    NativeTrackpadMonitor.shared.setForwarding(
+                        enabled,
+                        for: registrarView?.window)
                     result(true)
 
                 default:

@@ -4021,6 +4021,7 @@ class FFI {
     // Dispose relative mouse mode resources to ensure cursor is restored
     inputModel.disposeRelativeMouseMode();
     inputModel.disposeSideButtonTracking();
+    inputModel.disposeNativeTrackpadTracking();
     if (closeSession) {
       await bind.sessionClose(sessionId: sessionId);
     }

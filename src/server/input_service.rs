@@ -9,7 +9,10 @@ use dispatch::Queue;
 use enigo::{Enigo, Key, KeyboardControllable, MouseButton, MouseControllable};
 use hbb_common::{
     get_time,
-    message_proto::{pointer_device_event::Union::TouchEvent, touch_event::Union::ScaleUpdate},
+    message_proto::{
+        pointer_device_event::Union::{TouchEvent, TrackpadEvent},
+        touch_event::Union::ScaleUpdate,
+    },
     protobuf::EnumOrUnknown,
 };
 use rdev::{self, EventType, Key as RdevKey, KeyCode, RawKey};
@@ -1027,6 +1030,43 @@ pub fn handle_pointer_(evt: &PointerDeviceEvent, conn: i32) {
             }
             _ => {}
         },
+        Some(TrackpadEvent(evt)) => {
+            #[cfg(target_os = "linux")]
+            {
+                use crate::ipc::{DataTrackpadEvent, DataTrackpadPhase, DataTrackpadTouch};
+                use hbb_common::message_proto::trackpad_event::Phase;
+
+                let phase = match evt.phase.enum_value_or_default() {
+                    Phase::BEGIN => DataTrackpadPhase::Begin,
+                    Phase::UPDATE => DataTrackpadPhase::Update,
+                    Phase::END => DataTrackpadPhase::End,
+                    Phase::CANCEL => DataTrackpadPhase::Cancel,
+                };
+                let event = DataTrackpadEvent {
+                    phase,
+                    touches: evt
+                        .touches
+                        .iter()
+                        .take(5)
+                        .map(|touch| DataTrackpadTouch {
+                            id: touch.id,
+                            x: touch.x.clamp(0, 10_000),
+                            y: touch.y.clamp(0, 10_000),
+                        })
+                        .collect(),
+                };
+
+                let mut enigo = ENIGO.lock().unwrap();
+                if let Some(mouse) = enigo.get_custom_mouse() {
+                    if let Some(mouse) = mouse
+                        .as_mut_any()
+                        .downcast_mut::<super::uinput::client::UInputMouse>()
+                    {
+                        allow_err!(mouse.send_trackpad(event));
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }

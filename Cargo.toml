@@ -179,6 +179,10 @@ pulse = { package = "libpulse-binding", version = "2.27" }
 rust-pulsectl = { git = "https://github.com/rustdesk-org/pulsectl" }
 async-process = "1.7"
 evdev = { git="https://github.com/rustdesk-org/evdev" }
+# Keep the existing evdev fork for keyboard/mouse compatibility. Newer evdev
+# adds absolute-axis uinput setup, which is required to expose remote
+# multi-touch contacts as a real libinput touchpad.
+evdev_13 = { package = "evdev", version = "0.13.2" }
 dbus = "0.9"
 dbus-crossroads = "0.5"
 pam = { git="https://github.com/rustdesk-org/pam" }

@@ -340,6 +340,17 @@ class InputModel {
   // or a different button was pressed in between.
   static final Map<MouseButtons, InputModel> _sideButtonDownModels = {};
   static bool _sideButtonChannelInitialized = false;
+  static InputModel? _activeTrackpadModel;
+  static bool _trackpadChannelInitialized = false;
+
+  static void initNativeTrackpadChannel() {
+    if (!isMacOS || _trackpadChannelInitialized) return;
+    _trackpadChannelInitialized = true;
+    RelativeMouseModel.initHostChannel();
+    RelativeMouseModel.onTrackpadTouches = (args) {
+      _activeTrackpadModel?._onNativeTrackpadTouches(args);
+    };
+  }
 
   /// Each Flutter engine (main window + sub-windows from desktop_multi_window)
   /// runs its own Dart isolate with its own statics. Called from initEnv()
@@ -405,6 +416,16 @@ class InputModel {
     }
   }
 
+  void disposeNativeTrackpadTracking() {
+    if (_activeTrackpadModel == this) {
+      if (_nativeTrackpadGestureActive) {
+        _sendNativeTrackpadCancel();
+      }
+      _activeTrackpadModel = null;
+      unawaited(RelativeMouseModel.setNativeTrackpadForwarding(false));
+    }
+  }
+
   final WeakReference<FFI> parent;
   String keyboardMode = '';
 
@@ -435,6 +456,7 @@ class InputModel {
   int _trackpadSpeed = kDefaultTrackpadSpeed;
   double _trackpadSpeedInner = kDefaultTrackpadSpeed / 100.0;
   var _trackpadScrollUnsent = Offset.zero;
+  var _nativeTrackpadGestureActive = false;
 
   // Mobile relative mouse delta accumulators (for slow/fine movements).
   double _mobileDeltaRemainderX = 0.0;
@@ -495,6 +517,7 @@ class InputModel {
 
   InputModel(this.parent) {
     initSideButtonChannel();
+    initNativeTrackpadChannel();
     sessionId = parent.target!.sessionId;
     _relativeMouse = RelativeMouseModel(
       sessionId: sessionId,
@@ -1149,6 +1172,18 @@ class InputModel {
       _activeSideButtonModel = null;
     }
 
+    if (isMacOS) {
+      if (enter) {
+        _activeTrackpadModel = this;
+      } else if (_activeTrackpadModel == this) {
+        if (_nativeTrackpadGestureActive) {
+          _sendNativeTrackpadCancel();
+        }
+        _activeTrackpadModel = null;
+      }
+      unawaited(RelativeMouseModel.setNativeTrackpadForwarding(enter));
+    }
+
     // Fix status
     if (!enter) {
       resetModifiers();
@@ -1324,8 +1359,54 @@ class InputModel {
     }
   }
 
+  void _onNativeTrackpadTouches(Map<dynamic, dynamic> args) {
+    if (!keyboardPerm || isViewOnly || isViewCamera) return;
+    final phase = args['phase'];
+    final touches = args['touches'];
+    if (phase is! String || touches is! List) return;
+    if (!const {'begin', 'update', 'end', 'cancel'}.contains(phase)) return;
+
+    final normalizedTouches = <Map<String, int>>[];
+    for (final value in touches.take(5)) {
+      if (value is! Map) continue;
+      final id = value['id'];
+      final x = value['x'];
+      final y = value['y'];
+      if (id is int && x is int && y is int) {
+        normalizedTouches.add({
+          'id': id,
+          'x': x.clamp(0, 10000).toInt(),
+          'y': y.clamp(0, 10000).toInt(),
+        });
+      }
+    }
+
+    if (phase == 'begin') {
+      waitLastFlingDone();
+      _nativeTrackpadGestureActive = true;
+    } else if (phase == 'end' || phase == 'cancel') {
+      _nativeTrackpadGestureActive = false;
+    }
+
+    bind.sessionSendPointer(
+      sessionId: sessionId,
+      msg: json.encode(modify(
+          PointerEventToRust('trackpad', phase, normalizedTouches).toJson())),
+    );
+  }
+
+  void _sendNativeTrackpadCancel() {
+    _nativeTrackpadGestureActive = false;
+    bind.sessionSendPointer(
+      sessionId: sessionId,
+      msg: json.encode(
+          modify(PointerEventToRust('trackpad', 'cancel', const []).toJson())),
+    );
+  }
+
   // https://docs.flutter.dev/release/breaking-changes/trackpad-gestures
   void onPointerPanZoomUpdate(PointerPanZoomUpdateEvent e) {
+    if (_nativeTrackpadGestureActive) return;
     if (isViewOnly) return;
     if (isViewCamera) return;
     if (peerPlatform != kPeerPlatformAndroid) {
@@ -1450,6 +1531,7 @@ class InputModel {
   }
 
   void onPointerPanZoomEnd(PointerPanZoomEndEvent e) {
+    if (_nativeTrackpadGestureActive) return;
     if (isViewCamera) return;
     if (peerPlatform == kPeerPlatformAndroid) {
       handlePointerEvent('touch', kMouseEventTypePanEnd, e.position);

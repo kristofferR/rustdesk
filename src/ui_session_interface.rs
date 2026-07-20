@@ -1203,6 +1203,35 @@ impl<T: InvokeUiSession> Session<T> {
         send_pointer_device_event(evt, alt, ctrl, shift, command, self);
     }
 
+    pub fn send_trackpad_event(
+        &self,
+        phase: &str,
+        touches: Vec<TrackpadTouch>,
+        alt: bool,
+        ctrl: bool,
+        shift: bool,
+        command: bool,
+    ) {
+        let phase = match phase {
+            "begin" => trackpad_event::Phase::BEGIN,
+            "update" => trackpad_event::Phase::UPDATE,
+            "end" => trackpad_event::Phase::END,
+            "cancel" => trackpad_event::Phase::CANCEL,
+            _ => {
+                log::warn!("unknown trackpad event phase: {}", phase);
+                return;
+            }
+        };
+        let event = TrackpadEvent {
+            phase: hbb_common::protobuf::EnumOrUnknown::new(phase),
+            touches,
+            ..Default::default()
+        };
+        let mut evt = PointerDeviceEvent::new();
+        evt.set_trackpad_event(event);
+        send_pointer_device_event(evt, alt, ctrl, shift, command, self);
+    }
+
     #[inline]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn is_scroll_reverse_mode(&self) -> bool {

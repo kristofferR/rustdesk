@@ -1098,20 +1098,13 @@ pub mod service {
                     return;
                 }
             };
-            // Create the touchpad before the first gesture so udev/libinput and
-            // the compositor have time to discover it. Keep the event-path
-            // retry in handle_mouse for systems where uinput becomes available
-            // after this connection starts.
-            let mut trackpad = match VirtualTrackpad::new() {
-                Ok(device) => {
-                    log::info!("UInput virtual trackpad created successfully");
-                    Some(device)
-                }
-                Err(err) => {
-                    log::error!("Failed to create UInput virtual trackpad: {}", err);
-                    None
-                }
-            };
+            // The touchpad is created lazily by handle_mouse on the first
+            // trackpad event, so connections that never forward gestures do
+            // not expose an extra input device on the host. macOS clients
+            // prime that path with an empty cancel event as soon as gesture
+            // forwarding is enabled, giving udev/libinput and the compositor
+            // time to discover the device before the first real gesture.
+            let mut trackpad: Option<VirtualTrackpad> = None;
             loop {
                 tokio::select! {
                     res = stream.next() => {

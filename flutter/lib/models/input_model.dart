@@ -453,6 +453,7 @@ class InputModel {
   double _trackpadSpeedInner = kDefaultTrackpadSpeed / 100.0;
   var _trackpadScrollUnsent = Offset.zero;
   var _nativeTrackpadGestureActive = false;
+  var _nativeTrackpadPrimed = false;
 
   // Mobile relative mouse delta accumulators (for slow/fine movements).
   double _mobileDeltaRemainderX = 0.0;
@@ -1246,6 +1247,13 @@ class InputModel {
         epoch == _nativeTrackpadTransitionEpoch &&
         _activeTrackpadModel == this) {
       _activeTrackpadModel = null;
+    }
+    if (enabled && !_nativeTrackpadPrimed) {
+      // The host creates its uinput touchpad on the first trackpad event.
+      // Send a no-op cancel now, while the pointer is entering the canvas,
+      // so libinput discovers the device before the first real gesture.
+      _nativeTrackpadPrimed = true;
+      _sendNativeTrackpadCancel();
     }
   }
 

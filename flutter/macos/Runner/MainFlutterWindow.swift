@@ -19,6 +19,9 @@ import window_manager
 import window_size
 import texture_rgba_renderer
 
+@_silgen_name("rustdesk_set_macos_trackpad_suppression")
+private func rustdeskSetMacosTrackpadSuppression(_ enabled: Int32) -> Int32
+
 // Global state for relative mouse mode
 // All properties and methods must be accessed on the main thread since they
 // interact with NSEvent monitors, CoreGraphics APIs, and Flutter channels.
@@ -63,12 +66,39 @@ private final class NativeTrackpadMonitor {
 
     private var states: [Int: NativeTrackpadWindowState] = [:]
     private var eventMonitor: Any?
+    private var suppressionRequested = false
+    private var applicationObservers: [NSObjectProtocol] = []
 
     private init() {
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.gesture]) {
             [weak self] event in
             return self?.handle(event) ?? event
         }
+        let center = NotificationCenter.default
+        applicationObservers.append(center.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: NSApp,
+            queue: .main
+        ) { [weak self] _ in
+            self?.updateSuppressionRequest()
+        })
+        applicationObservers.append(center.addObserver(
+            forName: NSApplication.willResignActiveNotification,
+            object: NSApp,
+            queue: .main
+        ) { [weak self] _ in
+            self?.updateSuppressionRequest(applicationActive: false)
+        })
+        applicationObservers.append(center.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: NSApp,
+            queue: .main
+        ) { _ in
+            _ = rustdeskSetMacosTrackpadSuppression(0)
+        })
+        // Repair a snapshot left by an abnormal previous exit before a new
+        // remote-control session can begin.
+        _ = rustdeskSetMacosTrackpadSuppression(0)
     }
 
     func register(view: NSView?, channel: FlutterMethodChannel) {
@@ -98,6 +128,7 @@ private final class NativeTrackpadMonitor {
             state.reset()
         }
         state.forwardingEnabled = enabled
+        updateSuppressionRequest()
     }
 
     private func send(
@@ -157,6 +188,19 @@ private final class NativeTrackpadMonitor {
 
     private func pruneClosedWindows() {
         states = states.filter { $0.value.window != nil }
+        updateSuppressionRequest()
+    }
+
+    private func updateSuppressionRequest(applicationActive: Bool? = nil) {
+        let isActive = applicationActive ?? NSApp.isActive
+        let requested = isActive && states.values.contains { $0.forwardingEnabled }
+        guard requested != suppressionRequested else { return }
+        if rustdeskSetMacosTrackpadSuppression(requested ? 1 : 0) != 0 {
+            suppressionRequested = requested
+        } else {
+            NSLog("[RustDesk] Failed to %@ macOS workspace gestures",
+                  requested ? "suspend" : "restore")
+        }
     }
 }
 

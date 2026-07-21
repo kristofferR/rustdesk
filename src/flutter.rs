@@ -117,6 +117,12 @@ pub extern "C" fn rustdesk_core_main() -> bool {
 
 #[cfg(target_os = "macos")]
 #[no_mangle]
+pub extern "C" fn rustdesk_set_macos_trackpad_suppression(enabled: c_int) -> c_int {
+    crate::platform::macos::set_trackpad_workspace_gestures_suppressed(enabled != 0) as c_int
+}
+
+#[cfg(target_os = "macos")]
+#[no_mangle]
 pub extern "C" fn handle_applicationShouldOpenUntitledFile() {
     crate::platform::macos::handle_application_should_open_untitled_file();
 }

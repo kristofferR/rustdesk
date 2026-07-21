@@ -43,6 +43,7 @@ private final class NativeTrackpadWindowState {
     let channel: FlutterMethodChannel
     var forwardingEnabled = false
     var gestureActive = false
+    var pinchActive = false
     var touchIDs: [NativeTrackpadTouchIdentity: Int] = [:]
     var nextTouchID = 1
 
@@ -53,6 +54,7 @@ private final class NativeTrackpadWindowState {
 
     func reset() {
         gestureActive = false
+        pinchActive = false
         touchIDs.removeAll(keepingCapacity: true)
         nextTouchID = 1
     }
@@ -76,8 +78,9 @@ private struct NativeTrackpadTouchIdentity: Hashable {
 }
 
 /// Captures public AppKit indirect-touch snapshots without consuming ordinary
-/// mouse or two-finger scrolling. Three-or-more-finger sequences are consumed
-/// only while the pointer is inside a remote desktop canvas.
+/// mouse or two-finger scrolling. Three-or-more-finger sequences, and the
+/// two-finger sequences macOS classifies as a pinch, are consumed only while
+/// the pointer is inside a remote desktop canvas.
 private final class NativeTrackpadMonitor {
     static let shared = NativeTrackpadMonitor()
 
@@ -87,7 +90,7 @@ private final class NativeTrackpadMonitor {
     private var applicationObservers: [NSObjectProtocol] = []
 
     private init() {
-        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.gesture]) {
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.gesture, .magnify]) {
             [weak self] event in
             return self?.handle(event) ?? event
         }
@@ -158,8 +161,10 @@ private final class NativeTrackpadMonitor {
     func setForwarding(_ enabled: Bool, for window: NSWindow?) -> Bool {
         guard let window = window,
               let state = states[window.windowNumber] else { return false }
-        if !enabled && state.gestureActive {
-            send(phase: "cancel", touches: [], state: state)
+        if !enabled {
+            if state.gestureActive {
+                send(phase: "cancel", touches: [], state: state)
+            }
             state.reset()
         }
         state.forwardingEnabled = enabled
@@ -188,10 +193,28 @@ private final class NativeTrackpadMonitor {
               let state = states[window.windowNumber],
               state.forwardingEnabled else { return event }
 
+        // macOS classifies two-finger sequences as scroll or pinch. While a
+        // pinch is active, forward its two contacts so libinput recognizes
+        // the zoom on the host, and consume the local magnification so only
+        // the remote side zooms. Scroll sequences are never seen here and
+        // keep their existing wheel-event path.
+        if event.type == .magnify {
+            switch event.phase {
+            case .began:
+                state.pinchActive = true
+            case .ended, .cancelled:
+                state.pinchActive = false
+            default:
+                break
+            }
+            return nil
+        }
+
         let touching = event.touches(matching: .touching, in: nil)
         let wasActive = state.gestureActive
+        let minTouches = state.pinchActive ? 2 : 3
 
-        if touching.count >= 3 {
+        if touching.count >= minTouches {
             var contacts: [[String: Any]] = []
             contacts.reserveCapacity(min(touching.count, 5))
             let orderedTouches = touching.sorted { lhs, rhs in
@@ -268,8 +291,8 @@ private final class NativeTrackpadMonitor {
         for state in states.values where window == nil || state.window === window {
             if state.gestureActive {
                 send(phase: "cancel", touches: [], state: state)
-                state.reset()
             }
+            state.reset()
             state.forwardingEnabled = false
         }
     }
@@ -291,8 +314,8 @@ private final class NativeTrackpadMonitor {
                 for state in states.values where state.forwardingEnabled {
                     if state.gestureActive {
                         send(phase: "cancel", touches: [], state: state)
-                        state.reset()
                     }
+                    state.reset()
                     state.forwardingEnabled = false
                 }
             }

@@ -316,7 +316,9 @@ pub mod service {
         }
 
         fn update(&mut self, touches: &[DataTrackpadTouch]) -> ResultType<()> {
-            if touches.len() < 3 || touches.len() > TRACKPAD_MAX_SLOTS {
+            // Two contacts carry macOS-classified pinches; three or more carry
+            // swipe gestures. Single contacts stay on the regular mouse path.
+            if touches.len() < 2 || touches.len() > TRACKPAD_MAX_SLOTS {
                 return self.release_all();
             }
 
@@ -420,6 +422,10 @@ pub mod service {
         #[test]
         fn selects_linux_tool_count_keys() {
             assert_eq!(VirtualTrackpad::tool_for_count(0), None);
+            assert_eq!(
+                VirtualTrackpad::tool_for_count(2),
+                Some(TouchKeyCode::BTN_TOOL_DOUBLETAP)
+            );
             assert_eq!(
                 VirtualTrackpad::tool_for_count(3),
                 Some(TouchKeyCode::BTN_TOOL_TRIPLETAP)

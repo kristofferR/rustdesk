@@ -248,7 +248,7 @@ class _RemotePageState extends State<RemotePage>
     // When window loses focus, temporarily release relative mouse mode constraints
     // to allow user to interact with other applications normally.
     // The cursor will be re-hidden and re-centered when window regains focus.
-    if (_ffi.inputModel.relativeMouseMode.value) {
+    if (_ffi.inputModel.relativeMouseMode.value || isMacOS) {
       _ffi.inputModel.onWindowBlur();
     }
   }
@@ -265,6 +265,8 @@ class _RemotePageState extends State<RemotePage>
     // Restore relative mouse mode constraints when window regains focus.
     if (_ffi.inputModel.relativeMouseMode.value) {
       _rawKeyFocusNode.requestFocus();
+    }
+    if (_ffi.inputModel.relativeMouseMode.value || isMacOS) {
       _ffi.inputModel.onWindowFocus();
     }
   }

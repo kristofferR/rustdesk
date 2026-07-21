@@ -419,19 +419,7 @@ class InputModel {
   }
 
   void disposeNativeTrackpadTracking() {
-    if (_activeTrackpadModel == this || _pendingTrackpadModel == this) {
-      ++_nativeTrackpadTransitionEpoch;
-      if (_pendingTrackpadModel == this) {
-        _pendingTrackpadModel = null;
-      }
-      if (_nativeTrackpadGestureActive) {
-        _sendNativeTrackpadCancel();
-      }
-      if (_activeTrackpadModel == this) {
-        _activeTrackpadModel = null;
-      }
-      unawaited(RelativeMouseModel.setNativeTrackpadForwarding(false));
-    }
+    _releaseNativeTrackpadOwnership();
   }
 
   final WeakReference<FFI> parent;
@@ -1218,18 +1206,23 @@ class InputModel {
       unawaited(_acquireNativeTrackpadAfterReset(epoch));
     } else if (!shouldOwn &&
         (_activeTrackpadModel == this || _pendingTrackpadModel == this)) {
-      ++_nativeTrackpadTransitionEpoch;
-      if (_pendingTrackpadModel == this) {
-        _pendingTrackpadModel = null;
-      }
-      if (_nativeTrackpadGestureActive) {
-        _sendNativeTrackpadCancel();
-      }
-      if (_activeTrackpadModel == this) {
-        _activeTrackpadModel = null;
-      }
-      unawaited(RelativeMouseModel.setNativeTrackpadForwarding(false));
+      _releaseNativeTrackpadOwnership();
     }
+  }
+
+  void _releaseNativeTrackpadOwnership() {
+    if (_activeTrackpadModel != this && _pendingTrackpadModel != this) return;
+    ++_nativeTrackpadTransitionEpoch;
+    if (_pendingTrackpadModel == this) {
+      _pendingTrackpadModel = null;
+    }
+    if (_nativeTrackpadGestureActive) {
+      _sendNativeTrackpadCancel();
+    }
+    if (_activeTrackpadModel == this) {
+      _activeTrackpadModel = null;
+    }
+    unawaited(RelativeMouseModel.setNativeTrackpadForwarding(false));
   }
 
   Future<void> _acquireNativeTrackpadAfterReset(int epoch) async {
@@ -1370,20 +1363,7 @@ class InputModel {
 
   void onWindowBlur() {
     _relativeMouse.onWindowBlur();
-    if (isMacOS &&
-        (_activeTrackpadModel == this || _pendingTrackpadModel == this)) {
-      ++_nativeTrackpadTransitionEpoch;
-      if (_pendingTrackpadModel == this) {
-        _pendingTrackpadModel = null;
-      }
-      if (_nativeTrackpadGestureActive) {
-        _sendNativeTrackpadCancel();
-      }
-      if (_activeTrackpadModel == this) {
-        _activeTrackpadModel = null;
-      }
-      unawaited(RelativeMouseModel.setNativeTrackpadForwarding(false));
-    }
+    if (isMacOS) _releaseNativeTrackpadOwnership();
   }
 
   void onWindowFocus() {

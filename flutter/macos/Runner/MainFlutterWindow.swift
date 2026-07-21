@@ -194,7 +194,27 @@ private final class NativeTrackpadMonitor {
         if touching.count >= 3 {
             var contacts: [[String: Any]] = []
             contacts.reserveCapacity(min(touching.count, 5))
-            for touch in touching.prefix(5) {
+            let orderedTouches = touching.sorted { lhs, rhs in
+                let lhsIdentity = NativeTrackpadTouchIdentity(value: lhs.identity)
+                let rhsIdentity = NativeTrackpadTouchIdentity(value: rhs.identity)
+                let lhsID = state.touchIDs[lhsIdentity]
+                let rhsID = state.touchIDs[rhsIdentity]
+                if let lhsID = lhsID, let rhsID = rhsID {
+                    return lhsID < rhsID
+                }
+                if lhsID != nil { return true }
+                if rhsID != nil { return false }
+                if lhsIdentity.value.hash != rhsIdentity.value.hash {
+                    return lhsIdentity.value.hash < rhsIdentity.value.hash
+                }
+                let lhsPosition = lhs.normalizedPosition
+                let rhsPosition = rhs.normalizedPosition
+                if lhsPosition.x != rhsPosition.x {
+                    return lhsPosition.x < rhsPosition.x
+                }
+                return lhsPosition.y < rhsPosition.y
+            }
+            for touch in orderedTouches.prefix(5) {
                 let identity = NativeTrackpadTouchIdentity(value: touch.identity)
                 let id: Int
                 if let existing = state.touchIDs[identity] {

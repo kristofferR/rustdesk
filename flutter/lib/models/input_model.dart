@@ -1174,14 +1174,21 @@ class InputModel {
 
     if (isMacOS) {
       if (enter) {
-        _activeTrackpadModel = this;
+        if (_activeTrackpadModel != this) {
+          final previous = _activeTrackpadModel;
+          if (previous?._nativeTrackpadGestureActive ?? false) {
+            previous!._sendNativeTrackpadCancel();
+          }
+          _activeTrackpadModel = this;
+          unawaited(RelativeMouseModel.setNativeTrackpadForwarding(true));
+        }
       } else if (_activeTrackpadModel == this) {
         if (_nativeTrackpadGestureActive) {
           _sendNativeTrackpadCancel();
         }
         _activeTrackpadModel = null;
+        unawaited(RelativeMouseModel.setNativeTrackpadForwarding(false));
       }
-      unawaited(RelativeMouseModel.setNativeTrackpadForwarding(enter));
     }
 
     // Fix status

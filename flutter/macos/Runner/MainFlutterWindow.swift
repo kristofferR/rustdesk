@@ -43,7 +43,7 @@ private final class NativeTrackpadWindowState {
     let channel: FlutterMethodChannel
     var forwardingEnabled = false
     var gestureActive = false
-    var touchIDs: [ObjectIdentifier: Int] = [:]
+    var touchIDs: [NativeTrackpadTouchIdentity: Int] = [:]
     var nextTouchID = 1
 
     init(window: NSWindow, channel: FlutterMethodChannel) {
@@ -55,6 +55,23 @@ private final class NativeTrackpadWindowState {
         gestureActive = false
         touchIDs.removeAll(keepingCapacity: true)
         nextTouchID = 1
+    }
+}
+
+/// NSTouch identity values are stable by `isEqual`/`hash` for the lifetime of
+/// a contact, but AppKit does not guarantee the same object pointer each time.
+private struct NativeTrackpadTouchIdentity: Hashable {
+    let value: NSCopying & NSObjectProtocol
+
+    static func == (
+        lhs: NativeTrackpadTouchIdentity,
+        rhs: NativeTrackpadTouchIdentity
+    ) -> Bool {
+        lhs.value.isEqual(rhs.value)
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(value.hash)
     }
 }
 
@@ -154,7 +171,7 @@ private final class NativeTrackpadMonitor {
             var contacts: [[String: Any]] = []
             contacts.reserveCapacity(min(touching.count, 5))
             for touch in touching.prefix(5) {
-                let identity = ObjectIdentifier(touch.identity as AnyObject)
+                let identity = NativeTrackpadTouchIdentity(value: touch.identity)
                 let id: Int
                 if let existing = state.touchIDs[identity] {
                     id = existing

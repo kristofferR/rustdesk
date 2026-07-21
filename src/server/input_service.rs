@@ -632,6 +632,20 @@ pub async fn setup_uinput(minx: i32, maxx: i32, miny: i32, maxy: i32) -> ResultT
 }
 
 #[cfg(target_os = "linux")]
+pub fn supports_native_trackpad() -> bool {
+    let mut enigo = ENIGO.lock().unwrap();
+    enigo
+        .get_custom_mouse()
+        .as_mut()
+        .map(|mouse| {
+            mouse
+                .as_mut_any()
+                .is::<super::uinput::client::UInputMouse>()
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
 pub async fn setup_rdp_input() -> ResultType<(), Box<dyn std::error::Error>> {
     let mut en = ENIGO.lock()?;
     let rdp_info_lock = RDP_SESSION_INFO.lock()?;

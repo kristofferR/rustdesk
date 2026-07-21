@@ -341,6 +341,8 @@ class InputModel {
   static final Map<MouseButtons, InputModel> _sideButtonDownModels = {};
   static bool _sideButtonChannelInitialized = false;
   static InputModel? _activeTrackpadModel;
+  static InputModel? _pendingTrackpadModel;
+  static int _nativeTrackpadTransitionEpoch = 0;
   static bool _trackpadChannelInitialized = false;
 
   static void initNativeTrackpadChannel() {
@@ -417,11 +419,17 @@ class InputModel {
   }
 
   void disposeNativeTrackpadTracking() {
-    if (_activeTrackpadModel == this) {
+    if (_activeTrackpadModel == this || _pendingTrackpadModel == this) {
+      ++_nativeTrackpadTransitionEpoch;
+      if (_pendingTrackpadModel == this) {
+        _pendingTrackpadModel = null;
+      }
       if (_nativeTrackpadGestureActive) {
         _sendNativeTrackpadCancel();
       }
-      _activeTrackpadModel = null;
+      if (_activeTrackpadModel == this) {
+        _activeTrackpadModel = null;
+      }
       unawaited(RelativeMouseModel.setNativeTrackpadForwarding(false));
     }
   }
@@ -508,6 +516,12 @@ class InputModel {
   bool get showMyCursor => parent.target!.ffiModel.showMyCursor;
   double get devicePixelRatio => parent.target!.canvasModel.devicePixelRatio;
   bool get isViewCamera => parent.target!.connType == ConnType.viewCamera;
+  bool get _canForwardNativeTrackpad =>
+      peerPlatform == kPeerPlatformLinux &&
+      parent.target!.ffiModel.pi.supportsNativeTrackpad &&
+      keyboardPerm &&
+      !isViewOnly &&
+      !isViewCamera;
   int get trackpadSpeed => _trackpadSpeed;
   bool get useEdgeScroll =>
       parent.target!.canvasModel.scrollStyle == ScrollStyle.scrolledge;
@@ -1172,24 +1186,7 @@ class InputModel {
       _activeSideButtonModel = null;
     }
 
-    if (isMacOS) {
-      if (enter) {
-        if (_activeTrackpadModel != this) {
-          final previous = _activeTrackpadModel;
-          if (previous?._nativeTrackpadGestureActive ?? false) {
-            previous!._sendNativeTrackpadCancel();
-          }
-          _activeTrackpadModel = this;
-          unawaited(RelativeMouseModel.setNativeTrackpadForwarding(true));
-        }
-      } else if (_activeTrackpadModel == this) {
-        if (_nativeTrackpadGestureActive) {
-          _sendNativeTrackpadCancel();
-        }
-        _activeTrackpadModel = null;
-        unawaited(RelativeMouseModel.setNativeTrackpadForwarding(false));
-      }
-    }
+    refreshNativeTrackpadForwarding();
 
     // Fix status
     if (!enter) {
@@ -1202,6 +1199,60 @@ class InputModel {
     }
     if (!isWeb && enter) {
       bind.setCurSessionId(sessionId: sessionId);
+    }
+  }
+
+  void refreshNativeTrackpadForwarding() {
+    if (!isMacOS) return;
+    final shouldOwn = _pointerInsideImage && _canForwardNativeTrackpad;
+    if (shouldOwn &&
+        _activeTrackpadModel != this &&
+        _pendingTrackpadModel != this) {
+      final previous = _activeTrackpadModel;
+      if (previous?._nativeTrackpadGestureActive ?? false) {
+        previous!._sendNativeTrackpadCancel();
+      }
+      _activeTrackpadModel = null;
+      _pendingTrackpadModel = this;
+      final epoch = ++_nativeTrackpadTransitionEpoch;
+      unawaited(_acquireNativeTrackpadAfterReset(epoch));
+    } else if (!shouldOwn &&
+        (_activeTrackpadModel == this || _pendingTrackpadModel == this)) {
+      ++_nativeTrackpadTransitionEpoch;
+      if (_pendingTrackpadModel == this) {
+        _pendingTrackpadModel = null;
+      }
+      if (_nativeTrackpadGestureActive) {
+        _sendNativeTrackpadCancel();
+      }
+      if (_activeTrackpadModel == this) {
+        _activeTrackpadModel = null;
+      }
+      unawaited(RelativeMouseModel.setNativeTrackpadForwarding(false));
+    }
+  }
+
+  Future<void> _acquireNativeTrackpadAfterReset(int epoch) async {
+    // Disabling first resets the native monitor's gesture state. Keep routing
+    // unowned while that happens so an in-flight update cannot reach the new
+    // peer before its first begin event.
+    await RelativeMouseModel.setNativeTrackpadForwarding(false);
+    if (epoch != _nativeTrackpadTransitionEpoch ||
+        !_pointerInsideImage ||
+        !_canForwardNativeTrackpad) {
+      if (epoch == _nativeTrackpadTransitionEpoch &&
+          _pendingTrackpadModel == this) {
+        _pendingTrackpadModel = null;
+      }
+      return;
+    }
+    _pendingTrackpadModel = null;
+    _activeTrackpadModel = this;
+    final enabled = await RelativeMouseModel.setNativeTrackpadForwarding(true);
+    if (!enabled &&
+        epoch == _nativeTrackpadTransitionEpoch &&
+        _activeTrackpadModel == this) {
+      _activeTrackpadModel = null;
     }
   }
 
@@ -1319,10 +1370,25 @@ class InputModel {
 
   void onWindowBlur() {
     _relativeMouse.onWindowBlur();
+    if (isMacOS &&
+        (_activeTrackpadModel == this || _pendingTrackpadModel == this)) {
+      ++_nativeTrackpadTransitionEpoch;
+      if (_pendingTrackpadModel == this) {
+        _pendingTrackpadModel = null;
+      }
+      if (_nativeTrackpadGestureActive) {
+        _sendNativeTrackpadCancel();
+      }
+      if (_activeTrackpadModel == this) {
+        _activeTrackpadModel = null;
+      }
+      unawaited(RelativeMouseModel.setNativeTrackpadForwarding(false));
+    }
   }
 
   void onWindowFocus() {
     _relativeMouse.onWindowFocus();
+    refreshNativeTrackpadForwarding();
   }
 
   void onPointHoverImage(PointerHoverEvent e) {
@@ -1367,11 +1433,16 @@ class InputModel {
   }
 
   void _onNativeTrackpadTouches(Map<dynamic, dynamic> args) {
-    if (!keyboardPerm || isViewOnly || isViewCamera) return;
     final phase = args['phase'];
     final touches = args['touches'];
     if (phase is! String || touches is! List) return;
     if (!const {'begin', 'update', 'end', 'cancel'}.contains(phase)) return;
+    if (!_canForwardNativeTrackpad) {
+      if (_nativeTrackpadGestureActive) {
+        _sendNativeTrackpadCancel();
+      }
+      return;
+    }
 
     final normalizedTouches = <Map<String, int>>[];
     for (final value in touches.take(5)) {

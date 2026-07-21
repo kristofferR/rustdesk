@@ -242,6 +242,7 @@ class FfiModel with ChangeNotifier {
         showToast(translate('rel-mouse-permission-lost-tip'));
       }
     }
+    parent.target?.inputModel.refreshNativeTrackpadForwarding();
 
     debugPrint('updatePermission: $_permissions');
     notifyListeners();
@@ -1469,6 +1470,7 @@ class FfiModel with ChangeNotifier {
           debugPrint('Failed to decode platformAdditions $e');
         }
       }
+      parent.target?.inputModel.refreshNativeTrackpadForwarding();
     }
 
     _pi.isSet.value = true;
@@ -1819,6 +1821,7 @@ class FfiModel with ChangeNotifier {
     }
     if (_viewOnly != value) {
       _viewOnly = value;
+      parent.target?.inputModel.refreshNativeTrackpadForwarding();
       notifyListeners();
     }
   }
@@ -4141,6 +4144,8 @@ class PeerInfo with ChangeNotifier {
   RxBool isSet = false.obs;
 
   bool get isWayland => platformAdditions[kPlatformAdditionsIsWayland] == true;
+  bool get supportsNativeTrackpad =>
+      platformAdditions[kPlatformAdditionsNativeTrackpad] == true;
   bool get isHeadless => platformAdditions[kPlatformAdditionsHeadless] == true;
   bool get isInstalled =>
       platform != kPeerPlatformWindows ||

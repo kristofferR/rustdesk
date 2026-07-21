@@ -104,13 +104,30 @@ private final class NativeTrackpadMonitor {
             object: NSApp,
             queue: .main
         ) { [weak self] _ in
+            self?.deactivateForwarding()
             self?.updateSuppressionRequest(applicationActive: false)
+        })
+        applicationObservers.append(center.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.updateSuppressionRequest()
+        })
+        applicationObservers.append(center.addObserver(
+            forName: NSWindow.didResignKeyNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            self?.deactivateForwarding(for: notification.object as? NSWindow)
+            self?.updateSuppressionRequest()
         })
         applicationObservers.append(center.addObserver(
             forName: NSApplication.willTerminateNotification,
             object: NSApp,
             queue: .main
-        ) { _ in
+        ) { [weak self] _ in
+            self?.cancelActiveGestures()
             _ = rustdeskSetMacosTrackpadSuppression(0)
         })
         // Repair a snapshot left by an abnormal previous exit before a new
@@ -137,15 +154,22 @@ private final class NativeTrackpadMonitor {
         }
     }
 
-    func setForwarding(_ enabled: Bool, for window: NSWindow?) {
+    @discardableResult
+    func setForwarding(_ enabled: Bool, for window: NSWindow?) -> Bool {
         guard let window = window,
-              let state = states[window.windowNumber] else { return }
+              let state = states[window.windowNumber] else { return false }
         if !enabled && state.gestureActive {
             send(phase: "cancel", touches: [], state: state)
             state.reset()
         }
         state.forwardingEnabled = enabled
-        updateSuppressionRequest()
+        if enabled && !updateSuppressionRequest() {
+            state.forwardingEnabled = false
+            return false
+        } else if !enabled {
+            _ = updateSuppressionRequest()
+        }
+        return true
     }
 
     private func send(
@@ -204,19 +228,57 @@ private final class NativeTrackpadMonitor {
     }
 
     private func pruneClosedWindows() {
+        for state in states.values where state.window == nil && state.gestureActive {
+            send(phase: "cancel", touches: [], state: state)
+            state.reset()
+        }
         states = states.filter { $0.value.window != nil }
-        updateSuppressionRequest()
+        _ = updateSuppressionRequest()
     }
 
-    private func updateSuppressionRequest(applicationActive: Bool? = nil) {
+    private func cancelActiveGestures(for window: NSWindow? = nil) {
+        for state in states.values where
+            state.gestureActive && (window == nil || state.window === window) {
+            send(phase: "cancel", touches: [], state: state)
+            state.reset()
+        }
+    }
+
+    private func deactivateForwarding(for window: NSWindow? = nil) {
+        for state in states.values where window == nil || state.window === window {
+            if state.gestureActive {
+                send(phase: "cancel", touches: [], state: state)
+                state.reset()
+            }
+            state.forwardingEnabled = false
+        }
+    }
+
+    @discardableResult
+    private func updateSuppressionRequest(
+        applicationActive: Bool? = nil
+    ) -> Bool {
         let isActive = applicationActive ?? NSApp.isActive
-        let requested = isActive && states.values.contains { $0.forwardingEnabled }
-        guard requested != suppressionRequested else { return }
+        let requested = isActive && states.values.contains {
+            $0.forwardingEnabled && $0.window?.isKeyWindow == true
+        }
+        guard requested != suppressionRequested else { return true }
         if rustdeskSetMacosTrackpadSuppression(requested ? 1 : 0) != 0 {
             suppressionRequested = requested
+            return true
         } else {
+            if requested {
+                for state in states.values where state.forwardingEnabled {
+                    if state.gestureActive {
+                        send(phase: "cancel", touches: [], state: state)
+                        state.reset()
+                    }
+                    state.forwardingEnabled = false
+                }
+            }
             NSLog("[RustDesk] Failed to %@ macOS workspace gestures",
                   requested ? "suspend" : "restore")
+            return false
         }
     }
 }
@@ -469,10 +531,10 @@ class MainFlutterWindow: NSWindow {
                 case "setNativeTrackpadForwarding":
                     let arg = call.arguments as? [String: Any]
                     let enabled = arg?["enabled"] as? Bool ?? false
-                    NativeTrackpadMonitor.shared.setForwarding(
+                    let success = NativeTrackpadMonitor.shared.setForwarding(
                         enabled,
                         for: registrarView?.window)
-                    result(true)
+                    result(success)
 
                 default:
                     result(FlutterMethodNotImplemented)

@@ -40,24 +40,15 @@ class RelativeMouseState {
 
 private final class NativeTrackpadWindowState {
     weak var window: NSWindow?
-    weak var view: NSView?
     let channel: FlutterMethodChannel
-    let recognizer: NSGestureRecognizer
     var forwardingEnabled = false
     var gestureActive = false
     var touchIDs: [NativeTrackpadTouchIdentity: Int] = [:]
     var nextTouchID = 1
 
-    init(
-        window: NSWindow,
-        view: NSView,
-        channel: FlutterMethodChannel,
-        recognizer: NSGestureRecognizer
-    ) {
+    init(window: NSWindow, channel: FlutterMethodChannel) {
         self.window = window
-        self.view = view
         self.channel = channel
-        self.recognizer = recognizer
     }
 
     func reset() {
@@ -84,79 +75,6 @@ private struct NativeTrackpadTouchIdentity: Hashable {
     }
 }
 
-private enum NativeTrackpadTouchResult {
-    case ignored
-    case began
-    case updated
-    case ended
-    case cancelled
-}
-
-/// Receives AppKit's reliable raw indirect-touch lifecycle. It never prevents
-/// another recognizer, so ordinary one/two-finger input keeps its normal path.
-private final class NativeTrackpadGestureRecognizer: NSGestureRecognizer {
-    private let handler: (NSEvent, Bool) -> NativeTrackpadTouchResult
-
-    init(handler: @escaping (NSEvent, Bool) -> NativeTrackpadTouchResult) {
-        self.handler = handler
-        super.init(target: nil, action: nil)
-        allowedTouchTypes = [.indirect]
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func touchesBegan(with event: NSEvent) {
-        super.touchesBegan(with: event)
-        apply(handler(event, false), event: event)
-    }
-
-    override func touchesMoved(with event: NSEvent) {
-        super.touchesMoved(with: event)
-        apply(handler(event, false), event: event)
-    }
-
-    override func touchesEnded(with event: NSEvent) {
-        super.touchesEnded(with: event)
-        apply(handler(event, false), event: event)
-    }
-
-    override func touchesCancelled(with event: NSEvent) {
-        super.touchesCancelled(with: event)
-        apply(handler(event, true), event: event)
-    }
-
-    override func canPrevent(_ preventedGestureRecognizer: NSGestureRecognizer) -> Bool {
-        return false
-    }
-
-    override func canBePrevented(by preventingGestureRecognizer: NSGestureRecognizer) -> Bool {
-        return false
-    }
-
-    private func apply(_ result: NativeTrackpadTouchResult, event: NSEvent) {
-        switch result {
-        case .began:
-            state = .began
-        case .updated:
-            state = state == .possible ? .began : .changed
-        case .ended:
-            state = .ended
-        case .cancelled:
-            state = .cancelled
-        case .ignored:
-            // Keep the recognizer eligible while a resting thumb remains;
-            // later non-resting contacts may still form a valid gesture.
-            let hasTrackedTouches = !event.touches(
-                matching: .touching, in: view).isEmpty
-            if !hasTrackedTouches && state == .possible {
-                state = .failed
-            }
-        }
-    }
-}
-
 /// Captures public AppKit indirect-touch snapshots without consuming ordinary
 /// mouse or two-finger scrolling. Three-or-more-finger sequences are consumed
 /// only while the pointer is inside a remote desktop canvas.
@@ -171,7 +89,7 @@ private final class NativeTrackpadMonitor {
     private init() {
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.gesture]) {
             [weak self] event in
-            return self?.filterGestureEvent(event) ?? event
+            return self?.handle(event) ?? event
         }
         let center = NotificationCenter.default
         applicationObservers.append(center.addObserver(
@@ -221,25 +139,13 @@ private final class NativeTrackpadMonitor {
         guard let view = view else { return }
         pruneClosedWindows()
         view.allowedTouchTypes = [.indirect]
-        view.wantsRestingTouches = false
-
-        let recognizer = NativeTrackpadGestureRecognizer {
-            [weak self, weak view] event, cancelled in
-            return self?.handleTouchEvent(
-                event, in: view, cancelled: cancelled) ?? .ignored
-        }
-        view.addGestureRecognizer(recognizer)
+        view.wantsRestingTouches = true
 
         let registerWindow = { [weak self, weak view] in
-            guard let self = self, let view = view,
-                  let window = view.window else { return }
-            if let previous = self.states[window.windowNumber],
-               let previousView = previous.view {
-                previousView.removeGestureRecognizer(previous.recognizer)
-            }
+            guard let self = self, let window = view?.window else { return }
             self.states[window.windowNumber] = NativeTrackpadWindowState(
-                window: window, view: view, channel: channel,
-                recognizer: recognizer)
+                window: window,
+                channel: channel)
         }
         if view.window == nil {
             DispatchQueue.main.async(execute: registerWindow)
@@ -276,37 +182,14 @@ private final class NativeTrackpadMonitor {
             arguments: ["phase": phase, "touches": touches])
     }
 
-    private func filterGestureEvent(_ event: NSEvent) -> NSEvent? {
+    private func handle(_ event: NSEvent) -> NSEvent? {
         pruneClosedWindows()
         guard let window = event.window,
               let state = states[window.windowNumber],
-              state.forwardingEnabled,
-              state.gestureActive else { return event }
-        return nil
-    }
+              state.forwardingEnabled else { return event }
 
-    private func handleTouchEvent(
-        _ event: NSEvent,
-        in view: NSView?,
-        cancelled: Bool
-    ) -> NativeTrackpadTouchResult {
-        pruneClosedWindows()
-        guard let window = event.window,
-              let state = states[window.windowNumber],
-              state.forwardingEnabled else { return .ignored }
-
-        let touching = event.touches(matching: .touching, in: view)
-            .filter { !$0.isResting }
+        let touching = event.touches(matching: .touching, in: nil)
         let wasActive = state.gestureActive
-
-        if cancelled {
-            if wasActive {
-                send(phase: "cancel", touches: [], state: state)
-                state.reset()
-                return .cancelled
-            }
-            return .ignored
-        }
 
         if touching.count >= 3 {
             var contacts: [[String: Any]] = []
@@ -352,15 +235,16 @@ private final class NativeTrackpadMonitor {
             contacts.sort { ($0["id"] as? Int ?? 0) < ($1["id"] as? Int ?? 0) }
             state.gestureActive = true
             send(phase: wasActive ? "update" : "begin", touches: contacts, state: state)
-            return wasActive ? .updated : .began
+            return nil
         }
 
         if wasActive {
-            send(phase: "end", touches: [], state: state)
+            let cancelled = !event.touches(matching: .cancelled, in: nil).isEmpty
+            send(phase: cancelled ? "cancel" : "end", touches: [], state: state)
             state.reset()
-            return .ended
+            return nil
         }
-        return .ignored
+        return event
     }
 
     private func pruneClosedWindows() {

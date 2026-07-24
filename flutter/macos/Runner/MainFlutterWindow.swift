@@ -193,25 +193,37 @@ private final class NativeTrackpadMonitor {
               let state = states[window.windowNumber],
               state.forwardingEnabled else { return event }
 
-        // macOS classifies two-finger sequences as scroll or pinch. While a
-        // pinch is active, forward its two contacts so libinput recognizes
-        // the zoom on the host, and consume the local magnification so only
-        // the remote side zooms. Scroll sequences are never seen here and
-        // keep their existing wheel-event path.
-        if event.type == .magnify {
+        let isMagnify = event.type == .magnify
+        let wasActive = state.gestureActive
+
+        // macOS classifies two-finger sequences as scroll or pinch. Magnify
+        // events carry the pinch touch snapshots, so let begin/change flow
+        // through the shared contact sender below. End/cancel must release
+        // the remote contacts directly instead of depending on a later
+        // generic gesture event that AppKit may never deliver.
+        if isMagnify {
             switch event.phase {
-            case .began:
-                state.pinchActive = true
-            case .ended, .cancelled:
-                state.pinchActive = false
+            case .ended:
+                if wasActive {
+                    send(phase: "end", touches: [], state: state)
+                }
+                state.reset()
+                return nil
+            case .cancelled:
+                if wasActive {
+                    send(phase: "cancel", touches: [], state: state)
+                }
+                state.reset()
+                return nil
             default:
-                break
+                // The event type itself is AppKit's pinch classification.
+                // Treat changed or phase-less magnify events as active too,
+                // so a missed begin notification cannot drop the sequence.
+                state.pinchActive = true
             }
-            return nil
         }
 
         let touching = event.touches(matching: .touching, in: nil)
-        let wasActive = state.gestureActive
         let minTouches = state.pinchActive ? 2 : 3
 
         if touching.count >= minTouches {
@@ -267,7 +279,7 @@ private final class NativeTrackpadMonitor {
             state.reset()
             return nil
         }
-        return event
+        return isMagnify ? nil : event
     }
 
     private func pruneClosedWindows() {

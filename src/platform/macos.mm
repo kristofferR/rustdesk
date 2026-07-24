@@ -5,11 +5,178 @@
 #include <Security/AuthorizationTags.h>
 
 #include <CoreGraphics/CoreGraphics.h>
+#include <dlfcn.h>
+#include <objc/message.h>
 #include <vector>
 #include <map>
 #include <set>
 #include <mutex>
 #include <string>
+
+namespace {
+
+NSString *const kTrackpadGestureBackupKey = @"RustDeskTrackpadGestureBackup";
+const char *const kTrackpadPreferenceFramework =
+    "/System/Library/PrivateFrameworks/PreferencePanesSupport.framework/PreferencePanesSupport";
+
+const SEL kTrackpadGestureGetters[] = {
+    @selector(threeFingerHorizSwipe),
+    @selector(threeFingerVertSwipe),
+    @selector(fourFingerHorizSwipe),
+    @selector(fourFingerVertSwipe),
+};
+
+const SEL kTrackpadGestureSetters[] = {
+    @selector(setThreeFingerHorizSwipe:),
+    @selector(setThreeFingerVertSwipe:),
+    @selector(setFourFingerHorizSwipe:),
+    @selector(setFourFingerVertSwipe:),
+};
+
+using ObjectGetter = id (*)(id, SEL);
+using IntegerGetter = NSInteger (*)(id, SEL);
+using BoolGetter = BOOL (*)(id, SEL);
+using IntegerSetter = void (*)(id, SEL, NSInteger);
+using BoolSetter = void (*)(id, SEL, BOOL);
+
+void *g_trackpadPreferenceFramework = nullptr;
+id g_trackpadGestureBackend = nil;
+bool g_trackpadGesturesSuppressed = false;
+
+id TrackpadGestureBackend() {
+    if (g_trackpadGestureBackend) return g_trackpadGestureBackend;
+
+    if (!g_trackpadPreferenceFramework) {
+        g_trackpadPreferenceFramework = dlopen(
+            kTrackpadPreferenceFramework,
+            RTLD_LAZY | RTLD_LOCAL
+        );
+    }
+    if (!g_trackpadPreferenceFramework) {
+        NSLog(@"[RustDesk] Could not load the macOS trackpad preferences backend: %s", dlerror());
+        return nil;
+    }
+
+    Class backendClass = NSClassFromString(@"MTTGestureBackEnd");
+    SEL sharedInstance = @selector(sharedInstance);
+    if (!backendClass || ![backendClass respondsToSelector:sharedInstance]) {
+        NSLog(@"[RustDesk] MTTGestureBackEnd is unavailable");
+        return nil;
+    }
+    id backend = reinterpret_cast<ObjectGetter>(objc_msgSend)(backendClass, sharedInstance);
+    for (size_t i = 0; i < 4; ++i) {
+        if (![backend respondsToSelector:kTrackpadGestureGetters[i]] ||
+            ![backend respondsToSelector:kTrackpadGestureSetters[i]]) {
+            NSLog(@"[RustDesk] The macOS trackpad gesture API is incomplete");
+            return nil;
+        }
+    }
+    if (![backend respondsToSelector:@selector(shouldSyncChangesToCloud)] ||
+        ![backend respondsToSelector:@selector(setShouldSyncChangesToCloud:)] ||
+        ![backend respondsToSelector:@selector(allowToCoalesce)] ||
+        ![backend respondsToSelector:@selector(setAllowToCoalesce:)]) {
+        NSLog(@"[RustDesk] The macOS trackpad gesture options API is incomplete");
+        return nil;
+    }
+    g_trackpadGestureBackend = backend;
+    return backend;
+}
+
+bool ApplyTrackpadGestureValues(id backend, NSArray<NSNumber *> *values) {
+    if (values.count != 4) return false;
+
+    BOOL syncToCloud = reinterpret_cast<BoolGetter>(objc_msgSend)(
+        backend,
+        @selector(shouldSyncChangesToCloud)
+    );
+    BOOL coalesce = reinterpret_cast<BoolGetter>(objc_msgSend)(
+        backend,
+        @selector(allowToCoalesce)
+    );
+    reinterpret_cast<BoolSetter>(objc_msgSend)(
+        backend,
+        @selector(setShouldSyncChangesToCloud:),
+        NO
+    );
+    reinterpret_cast<BoolSetter>(objc_msgSend)(
+        backend,
+        @selector(setAllowToCoalesce:),
+        NO
+    );
+    for (size_t i = 0; i < 4; ++i) {
+        reinterpret_cast<IntegerSetter>(objc_msgSend)(
+            backend,
+            kTrackpadGestureSetters[i],
+            values[i].integerValue
+        );
+    }
+    reinterpret_cast<BoolSetter>(objc_msgSend)(
+        backend,
+        @selector(setAllowToCoalesce:),
+        coalesce
+    );
+    reinterpret_cast<BoolSetter>(objc_msgSend)(
+        backend,
+        @selector(setShouldSyncChangesToCloud:),
+        syncToCloud
+    );
+    return true;
+}
+
+bool SetTrackpadWorkspaceGesturesSuppressed(bool suppressed) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSArray<NSNumber *> *backup = [defaults arrayForKey:kTrackpadGestureBackupKey];
+    if (!suppressed) {
+        if (backup) {
+            id backend = TrackpadGestureBackend();
+            if (!backend || !ApplyTrackpadGestureValues(backend, backup)) return false;
+            [defaults removeObjectForKey:kTrackpadGestureBackupKey];
+            [defaults synchronize];
+        }
+        g_trackpadGesturesSuppressed = false;
+        return true;
+    }
+
+    if (g_trackpadGesturesSuppressed) return true;
+    id backend = TrackpadGestureBackend();
+    if (!backend) return false;
+
+    // A saved snapshot means an earlier process exited abnormally. Restore it
+    // before taking a fresh snapshot so RustDesk never treats disabled values
+    // as the user's desired configuration.
+    if (backup) {
+        if (!ApplyTrackpadGestureValues(backend, backup)) return false;
+        [defaults removeObjectForKey:kTrackpadGestureBackupKey];
+    }
+
+    NSMutableArray<NSNumber *> *values = [NSMutableArray arrayWithCapacity:4];
+    for (size_t i = 0; i < 4; ++i) {
+        NSInteger value = reinterpret_cast<IntegerGetter>(objc_msgSend)(
+            backend,
+            kTrackpadGestureGetters[i]
+        );
+        [values addObject:@(value)];
+    }
+    [defaults setObject:values forKey:kTrackpadGestureBackupKey];
+    [defaults synchronize];
+
+    if (!ApplyTrackpadGestureValues(backend, @[@0, @0, @0, @0])) return false;
+    g_trackpadGesturesSuppressed = true;
+    return true;
+}
+
+} // namespace
+
+extern "C" bool MacSetTrackpadWorkspaceGesturesSuppressed(bool suppressed) {
+    if ([NSThread isMainThread]) {
+        return SetTrackpadWorkspaceGesturesSuppressed(suppressed);
+    }
+    __block bool result = false;
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        result = SetTrackpadWorkspaceGesturesSuppressed(suppressed);
+    });
+    return result;
+}
 
 extern "C" bool CanUseNewApiForScreenCaptureCheck() {
     #ifdef NO_InputMonitoringAuthStatus

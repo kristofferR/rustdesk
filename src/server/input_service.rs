@@ -9,7 +9,10 @@ use dispatch::Queue;
 use enigo::{Enigo, Key, KeyboardControllable, MouseButton, MouseControllable};
 use hbb_common::{
     get_time,
-    message_proto::{pointer_device_event::Union::TouchEvent, touch_event::Union::ScaleUpdate},
+    message_proto::{
+        pointer_device_event::Union::{TouchEvent, TrackpadEvent},
+        touch_event::Union::ScaleUpdate,
+    },
     protobuf::EnumOrUnknown,
 };
 use rdev::{self, EventType, Key as RdevKey, KeyCode, RawKey};
@@ -629,6 +632,20 @@ pub async fn setup_uinput(minx: i32, maxx: i32, miny: i32, maxy: i32) -> ResultT
 }
 
 #[cfg(target_os = "linux")]
+pub fn supports_native_trackpad() -> bool {
+    let mut enigo = ENIGO.lock().unwrap();
+    enigo
+        .get_custom_mouse()
+        .as_mut()
+        .map(|mouse| {
+            mouse
+                .as_mut_any()
+                .is::<super::uinput::client::UInputMouse>()
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
 pub async fn setup_rdp_input() -> ResultType<(), Box<dyn std::error::Error>> {
     let mut en = ENIGO.lock()?;
     let rdp_info_lock = RDP_SESSION_INFO.lock()?;
@@ -1027,6 +1044,46 @@ pub fn handle_pointer_(evt: &PointerDeviceEvent, conn: i32) {
             }
             _ => {}
         },
+        Some(TrackpadEvent(evt)) => {
+            #[cfg(not(target_os = "linux"))]
+            let _ = evt;
+
+            #[cfg(target_os = "linux")]
+            {
+                use crate::ipc::{DataTrackpadEvent, DataTrackpadPhase, DataTrackpadTouch};
+                use hbb_common::message_proto::trackpad_event::Phase;
+
+                let phase = match evt.phase.enum_value_or_default() {
+                    Phase::BEGIN => DataTrackpadPhase::Begin,
+                    Phase::UPDATE => DataTrackpadPhase::Update,
+                    Phase::END => DataTrackpadPhase::End,
+                    Phase::CANCEL => DataTrackpadPhase::Cancel,
+                };
+                let event = DataTrackpadEvent {
+                    phase,
+                    touches: evt
+                        .touches
+                        .iter()
+                        .take(5)
+                        .map(|touch| DataTrackpadTouch {
+                            id: touch.id,
+                            x: touch.x.clamp(0, 10_000),
+                            y: touch.y.clamp(0, 10_000),
+                        })
+                        .collect(),
+                };
+
+                let mut enigo = ENIGO.lock().unwrap();
+                if let Some(mouse) = enigo.get_custom_mouse() {
+                    if let Some(mouse) = mouse
+                        .as_mut_any()
+                        .downcast_mut::<super::uinput::client::UInputMouse>()
+                    {
+                        allow_err!(mouse.send_trackpad(event));
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }

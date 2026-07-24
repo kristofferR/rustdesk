@@ -1719,6 +1719,9 @@ impl Connection {
             if crate::platform::current_is_wayland() {
                 platform_additions.insert("is_wayland".into(), json!(true));
             }
+            if input_service::supports_native_trackpad() {
+                platform_additions.insert("native_trackpad".into(), json!(true));
+            }
             #[cfg(target_os = "linux")]
             if crate::platform::is_headless_allowed() {
                 if linux_desktop_manager::is_headless() {

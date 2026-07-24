@@ -68,6 +68,7 @@ extern "C" {
     fn IsCanScreenRecording(_: BOOL) -> BOOL;
     fn CanUseNewApiForScreenCaptureCheck() -> BOOL;
     fn MacCheckAdminAuthorization() -> BOOL;
+    fn MacSetTrackpadWorkspaceGesturesSuppressed(suppressed: bool) -> bool;
     fn MacGetModeNum(display: u32, numModes: *mut u32) -> BOOL;
     fn MacGetModes(
         display: u32,
@@ -82,6 +83,10 @@ extern "C" {
     fn MacSetMode(display: u32, width: u32, height: u32, tryHiDPI: bool) -> BOOL;
     fn CGWarpMouseCursorPosition(newCursorPosition: CGPoint) -> CGError;
     fn CGAssociateMouseAndMouseCursorPosition(connected: BooleanT) -> CGError;
+}
+
+pub(crate) fn set_trackpad_workspace_gestures_suppressed(suppressed: bool) -> bool {
+    unsafe { MacSetTrackpadWorkspaceGesturesSuppressed(suppressed) }
 }
 
 pub fn major_version() -> u32 {

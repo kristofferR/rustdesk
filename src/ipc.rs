@@ -262,7 +262,32 @@ pub enum DataMouse {
     Click(enigo::MouseButton),
     ScrollX(i32),
     ScrollY(i32),
+    Trackpad(DataTrackpadEvent),
     Refresh,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum DataTrackpadPhase {
+    Begin,
+    Update,
+    End,
+    Cancel,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+pub struct DataTrackpadTouch {
+    pub id: u32,
+    pub x: i32,
+    pub y: i32,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DataTrackpadEvent {
+    pub phase: DataTrackpadPhase,
+    pub touches: Vec<DataTrackpadTouch>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

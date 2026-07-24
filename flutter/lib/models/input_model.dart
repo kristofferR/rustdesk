@@ -340,6 +340,19 @@ class InputModel {
   // or a different button was pressed in between.
   static final Map<MouseButtons, InputModel> _sideButtonDownModels = {};
   static bool _sideButtonChannelInitialized = false;
+  static InputModel? _activeTrackpadModel;
+  static InputModel? _pendingTrackpadModel;
+  static int _nativeTrackpadTransitionEpoch = 0;
+  static bool _trackpadChannelInitialized = false;
+
+  static void initNativeTrackpadChannel() {
+    if (!isMacOS || _trackpadChannelInitialized) return;
+    _trackpadChannelInitialized = true;
+    RelativeMouseModel.initHostChannel();
+    RelativeMouseModel.onTrackpadTouches = (args) {
+      _activeTrackpadModel?._onNativeTrackpadTouches(args);
+    };
+  }
 
   /// Each Flutter engine (main window + sub-windows from desktop_multi_window)
   /// runs its own Dart isolate with its own statics. Called from initEnv()
@@ -405,6 +418,10 @@ class InputModel {
     }
   }
 
+  void disposeNativeTrackpadTracking() {
+    _releaseNativeTrackpadOwnership();
+  }
+
   final WeakReference<FFI> parent;
   String keyboardMode = '';
 
@@ -435,6 +452,8 @@ class InputModel {
   int _trackpadSpeed = kDefaultTrackpadSpeed;
   double _trackpadSpeedInner = kDefaultTrackpadSpeed / 100.0;
   var _trackpadScrollUnsent = Offset.zero;
+  var _nativeTrackpadGestureActive = false;
+  var _nativeTrackpadPrimed = false;
 
   // Mobile relative mouse delta accumulators (for slow/fine movements).
   double _mobileDeltaRemainderX = 0.0;
@@ -486,6 +505,12 @@ class InputModel {
   bool get showMyCursor => parent.target!.ffiModel.showMyCursor;
   double get devicePixelRatio => parent.target!.canvasModel.devicePixelRatio;
   bool get isViewCamera => parent.target!.connType == ConnType.viewCamera;
+  bool get _canForwardNativeTrackpad =>
+      peerPlatform == kPeerPlatformLinux &&
+      parent.target!.ffiModel.pi.supportsNativeTrackpad &&
+      keyboardPerm &&
+      !isViewOnly &&
+      !isViewCamera;
   int get trackpadSpeed => _trackpadSpeed;
   bool get useEdgeScroll =>
       parent.target!.canvasModel.scrollStyle == ScrollStyle.scrolledge;
@@ -495,6 +520,7 @@ class InputModel {
 
   InputModel(this.parent) {
     initSideButtonChannel();
+    initNativeTrackpadChannel();
     sessionId = parent.target!.sessionId;
     _relativeMouse = RelativeMouseModel(
       sessionId: sessionId,
@@ -1149,6 +1175,8 @@ class InputModel {
       _activeSideButtonModel = null;
     }
 
+    refreshNativeTrackpadForwarding();
+
     // Fix status
     if (!enter) {
       resetModifiers();
@@ -1160,6 +1188,72 @@ class InputModel {
     }
     if (!isWeb && enter) {
       bind.setCurSessionId(sessionId: sessionId);
+    }
+  }
+
+  void refreshNativeTrackpadForwarding() {
+    if (!isMacOS) return;
+    final shouldOwn = _pointerInsideImage && _canForwardNativeTrackpad;
+    if (shouldOwn &&
+        _activeTrackpadModel != this &&
+        _pendingTrackpadModel != this) {
+      final previous = _activeTrackpadModel;
+      if (previous?._nativeTrackpadGestureActive ?? false) {
+        previous!._sendNativeTrackpadCancel();
+      }
+      _activeTrackpadModel = null;
+      _pendingTrackpadModel = this;
+      final epoch = ++_nativeTrackpadTransitionEpoch;
+      unawaited(_acquireNativeTrackpadAfterReset(epoch));
+    } else if (!shouldOwn &&
+        (_activeTrackpadModel == this || _pendingTrackpadModel == this)) {
+      _releaseNativeTrackpadOwnership();
+    }
+  }
+
+  void _releaseNativeTrackpadOwnership() {
+    if (_activeTrackpadModel != this && _pendingTrackpadModel != this) return;
+    ++_nativeTrackpadTransitionEpoch;
+    if (_pendingTrackpadModel == this) {
+      _pendingTrackpadModel = null;
+    }
+    if (_nativeTrackpadGestureActive) {
+      _sendNativeTrackpadCancel();
+    }
+    if (_activeTrackpadModel == this) {
+      _activeTrackpadModel = null;
+    }
+    unawaited(RelativeMouseModel.setNativeTrackpadForwarding(false));
+  }
+
+  Future<void> _acquireNativeTrackpadAfterReset(int epoch) async {
+    // Disabling first resets the native monitor's gesture state. Keep routing
+    // unowned while that happens so an in-flight update cannot reach the new
+    // peer before its first begin event.
+    await RelativeMouseModel.setNativeTrackpadForwarding(false);
+    if (epoch != _nativeTrackpadTransitionEpoch ||
+        !_pointerInsideImage ||
+        !_canForwardNativeTrackpad) {
+      if (epoch == _nativeTrackpadTransitionEpoch &&
+          _pendingTrackpadModel == this) {
+        _pendingTrackpadModel = null;
+      }
+      return;
+    }
+    _pendingTrackpadModel = null;
+    _activeTrackpadModel = this;
+    final enabled = await RelativeMouseModel.setNativeTrackpadForwarding(true);
+    if (!enabled &&
+        epoch == _nativeTrackpadTransitionEpoch &&
+        _activeTrackpadModel == this) {
+      _activeTrackpadModel = null;
+    }
+    if (enabled && !_nativeTrackpadPrimed) {
+      // The host creates its uinput touchpad on the first trackpad event.
+      // Send a no-op cancel now, while the pointer is entering the canvas,
+      // so libinput discovers the device before the first real gesture.
+      _nativeTrackpadPrimed = true;
+      _sendNativeTrackpadCancel();
     }
   }
 
@@ -1277,10 +1371,12 @@ class InputModel {
 
   void onWindowBlur() {
     _relativeMouse.onWindowBlur();
+    if (isMacOS) _releaseNativeTrackpadOwnership();
   }
 
   void onWindowFocus() {
     _relativeMouse.onWindowFocus();
+    refreshNativeTrackpadForwarding();
   }
 
   void onPointHoverImage(PointerHoverEvent e) {
@@ -1324,8 +1420,59 @@ class InputModel {
     }
   }
 
+  void _onNativeTrackpadTouches(Map<dynamic, dynamic> args) {
+    final phase = args['phase'];
+    final touches = args['touches'];
+    if (phase is! String || touches is! List) return;
+    if (!const {'begin', 'update', 'end', 'cancel'}.contains(phase)) return;
+    if (!_canForwardNativeTrackpad) {
+      if (_nativeTrackpadGestureActive) {
+        _sendNativeTrackpadCancel();
+      }
+      return;
+    }
+
+    final normalizedTouches = <Map<String, int>>[];
+    for (final value in touches.take(5)) {
+      if (value is! Map) continue;
+      final id = value['id'];
+      final x = value['x'];
+      final y = value['y'];
+      if (id is int && x is int && y is int) {
+        normalizedTouches.add({
+          'id': id,
+          'x': x.clamp(0, 10000).toInt(),
+          'y': y.clamp(0, 10000).toInt(),
+        });
+      }
+    }
+
+    if (phase == 'begin') {
+      waitLastFlingDone();
+      _nativeTrackpadGestureActive = true;
+    } else if (phase == 'end' || phase == 'cancel') {
+      _nativeTrackpadGestureActive = false;
+    }
+
+    bind.sessionSendPointer(
+      sessionId: sessionId,
+      msg: json.encode(modify(
+          PointerEventToRust('trackpad', phase, normalizedTouches).toJson())),
+    );
+  }
+
+  void _sendNativeTrackpadCancel() {
+    _nativeTrackpadGestureActive = false;
+    bind.sessionSendPointer(
+      sessionId: sessionId,
+      msg: json.encode(
+          modify(PointerEventToRust('trackpad', 'cancel', const []).toJson())),
+    );
+  }
+
   // https://docs.flutter.dev/release/breaking-changes/trackpad-gestures
   void onPointerPanZoomUpdate(PointerPanZoomUpdateEvent e) {
+    if (_nativeTrackpadGestureActive) return;
     if (isViewOnly) return;
     if (isViewCamera) return;
     if (peerPlatform != kPeerPlatformAndroid) {
@@ -1450,6 +1597,7 @@ class InputModel {
   }
 
   void onPointerPanZoomEnd(PointerPanZoomEndEvent e) {
+    if (_nativeTrackpadGestureActive) return;
     if (isViewCamera) return;
     if (peerPlatform == kPeerPlatformAndroid) {
       handlePointerEvent('touch', kMouseEventTypePanEnd, e.position);

@@ -1,4 +1,7 @@
-use crate::ipc::{self, new_listener, Connection, Data, DataKeyboard, DataMouse};
+use crate::ipc::{
+    self, new_listener, Connection, Data, DataKeyboard, DataMouse, DataTrackpadEvent,
+    DataTrackpadPhase, DataTrackpadTouch,
+};
 use enigo::{Key, KeyboardControllable, MouseButton, MouseControllable};
 use evdev::{
     uinput::{VirtualDevice, VirtualDeviceBuilder},
@@ -132,6 +135,10 @@ pub mod client {
         pub fn send_refresh(&mut self) -> ResultType<()> {
             self.send(Data::Mouse(DataMouse::Refresh))
         }
+
+        pub fn send_trackpad(&mut self, event: DataTrackpadEvent) -> ResultType<()> {
+            self.send(Data::Mouse(DataMouse::Trackpad(event)))
+        }
     }
 
     impl MouseControllable for UInputMouse {
@@ -184,6 +191,11 @@ pub mod client {
 
 pub mod service {
     use super::*;
+    use evdev_13::{
+        uinput::VirtualDevice as TouchVirtualDevice, AbsInfo, AbsoluteAxisCode,
+        AttributeSet as TouchAttributeSet, EventType as TouchEventType,
+        InputEvent as TouchInputEvent, KeyCode as TouchKeyCode, PropType, UinputAbsSetup,
+    };
     use hbb_common::lazy_static;
     #[cfg(target_os = "linux")]
     use parity_tokio_ipc::Connection as RawIpcConnection;
@@ -193,6 +205,238 @@ pub mod service {
     #[cfg(target_os = "linux")]
     use std::os::unix::io::AsRawFd;
     use std::{collections::HashMap, sync::Mutex};
+
+    const TRACKPAD_COORD_MAX: i32 = 10_000;
+    const TRACKPAD_X_MAX: i32 = 4_000;
+    const TRACKPAD_Y_MAX: i32 = 2_500;
+    const TRACKPAD_MAX_SLOTS: usize = 5;
+
+    struct VirtualTrackpad {
+        device: TouchVirtualDevice,
+        slots: HashMap<u32, usize>,
+        current_tool: Option<TouchKeyCode>,
+    }
+
+    impl VirtualTrackpad {
+        fn new() -> ResultType<Self> {
+            let mut keys = TouchAttributeSet::<TouchKeyCode>::new();
+            for key in [
+                TouchKeyCode::BTN_TOUCH,
+                TouchKeyCode::BTN_TOOL_FINGER,
+                TouchKeyCode::BTN_TOOL_DOUBLETAP,
+                TouchKeyCode::BTN_TOOL_TRIPLETAP,
+                TouchKeyCode::BTN_TOOL_QUADTAP,
+                TouchKeyCode::BTN_TOOL_QUINTTAP,
+            ] {
+                keys.insert(key);
+            }
+
+            let mut properties = TouchAttributeSet::<PropType>::new();
+            properties.insert(PropType::POINTER);
+
+            let axis = |code, maximum, resolution| {
+                UinputAbsSetup::new(code, AbsInfo::new(0, 0, maximum, 0, 0, resolution))
+            };
+            let device = TouchVirtualDevice::builder()?
+                .name("RustDesk Virtual Trackpad")
+                .with_keys(&keys)?
+                .with_properties(&properties)?
+                .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_X, TRACKPAD_X_MAX, 40))?
+                .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_Y, TRACKPAD_Y_MAX, 40))?
+                .with_absolute_axis(&axis(
+                    AbsoluteAxisCode::ABS_MT_SLOT,
+                    (TRACKPAD_MAX_SLOTS - 1) as i32,
+                    0,
+                ))?
+                .with_absolute_axis(&axis(
+                    AbsoluteAxisCode::ABS_MT_POSITION_X,
+                    TRACKPAD_X_MAX,
+                    40,
+                ))?
+                .with_absolute_axis(&axis(
+                    AbsoluteAxisCode::ABS_MT_POSITION_Y,
+                    TRACKPAD_Y_MAX,
+                    40,
+                ))?
+                .with_absolute_axis(&axis(
+                    AbsoluteAxisCode::ABS_MT_TRACKING_ID,
+                    u16::MAX as i32,
+                    0,
+                ))?
+                .build()?;
+
+            Ok(Self {
+                device,
+                slots: HashMap::new(),
+                current_tool: None,
+            })
+        }
+
+        fn abs(code: AbsoluteAxisCode, value: i32) -> TouchInputEvent {
+            TouchInputEvent::new(TouchEventType::ABSOLUTE.0, code.0, value)
+        }
+
+        fn key(code: TouchKeyCode, value: i32) -> TouchInputEvent {
+            TouchInputEvent::new(TouchEventType::KEY.0, code.0, value)
+        }
+
+        fn tool_for_count(count: usize) -> Option<TouchKeyCode> {
+            match count {
+                1 => Some(TouchKeyCode::BTN_TOOL_FINGER),
+                2 => Some(TouchKeyCode::BTN_TOOL_DOUBLETAP),
+                3 => Some(TouchKeyCode::BTN_TOOL_TRIPLETAP),
+                4 => Some(TouchKeyCode::BTN_TOOL_QUADTAP),
+                5 => Some(TouchKeyCode::BTN_TOOL_QUINTTAP),
+                _ => None,
+            }
+        }
+
+        fn scale(value: i32, maximum: i32) -> i32 {
+            value.clamp(0, TRACKPAD_COORD_MAX) * maximum / TRACKPAD_COORD_MAX
+        }
+
+        fn release_all(&mut self) -> ResultType<()> {
+            if self.slots.is_empty() && self.current_tool.is_none() {
+                return Ok(());
+            }
+            let mut events = Vec::with_capacity(self.slots.len() * 2 + 2);
+            let mut slots: Vec<_> = self.slots.values().copied().collect();
+            slots.sort_unstable();
+            for slot in slots {
+                events.push(Self::abs(AbsoluteAxisCode::ABS_MT_SLOT, slot as i32));
+                events.push(Self::abs(AbsoluteAxisCode::ABS_MT_TRACKING_ID, -1));
+            }
+            if let Some(tool) = self.current_tool.take() {
+                events.push(Self::key(tool, 0));
+            }
+            events.push(Self::key(TouchKeyCode::BTN_TOUCH, 0));
+            self.device.emit(&events)?;
+            self.slots.clear();
+            Ok(())
+        }
+
+        fn update(&mut self, touches: &[DataTrackpadTouch]) -> ResultType<()> {
+            // Two contacts carry macOS-classified pinches; three or more carry
+            // swipe gestures. Single contacts stay on the regular mouse path.
+            if touches.len() < 2 || touches.len() > TRACKPAD_MAX_SLOTS {
+                return self.release_all();
+            }
+
+            let active_ids: std::collections::HashSet<_> =
+                touches.iter().map(|touch| touch.id).collect();
+            if active_ids.len() != touches.len() {
+                bail!("duplicate trackpad touch id");
+            }
+
+            let mut events = Vec::with_capacity(touches.len() * 4 + 8);
+            let released: Vec<_> = self
+                .slots
+                .iter()
+                .filter(|(id, _)| !active_ids.contains(id))
+                .map(|(id, slot)| (*id, *slot))
+                .collect();
+            for (id, slot) in released {
+                events.push(Self::abs(AbsoluteAxisCode::ABS_MT_SLOT, slot as i32));
+                events.push(Self::abs(AbsoluteAxisCode::ABS_MT_TRACKING_ID, -1));
+                self.slots.remove(&id);
+            }
+
+            for touch in touches {
+                let is_new = !self.slots.contains_key(&touch.id);
+                let slot = if let Some(slot) = self.slots.get(&touch.id) {
+                    *slot
+                } else {
+                    let Some(slot) = (0..TRACKPAD_MAX_SLOTS)
+                        .find(|slot| !self.slots.values().any(|used| used == slot))
+                    else {
+                        bail!("no free virtual trackpad slot");
+                    };
+                    self.slots.insert(touch.id, slot);
+                    slot
+                };
+                let x = Self::scale(touch.x, TRACKPAD_X_MAX);
+                let y = Self::scale(touch.y, TRACKPAD_Y_MAX);
+                events.push(Self::abs(AbsoluteAxisCode::ABS_MT_SLOT, slot as i32));
+                if is_new {
+                    events.push(Self::abs(
+                        AbsoluteAxisCode::ABS_MT_TRACKING_ID,
+                        (touch.id & u16::MAX as u32) as i32,
+                    ));
+                }
+                events.push(Self::abs(AbsoluteAxisCode::ABS_MT_POSITION_X, x));
+                events.push(Self::abs(AbsoluteAxisCode::ABS_MT_POSITION_Y, y));
+                if slot == 0 {
+                    events.push(Self::abs(AbsoluteAxisCode::ABS_X, x));
+                    events.push(Self::abs(AbsoluteAxisCode::ABS_Y, y));
+                }
+            }
+
+            let tool = Self::tool_for_count(touches.len());
+            if self.current_tool != tool {
+                if let Some(previous) = self.current_tool {
+                    events.push(Self::key(previous, 0));
+                }
+                if let Some(next) = tool {
+                    events.push(Self::key(next, 1));
+                }
+                self.current_tool = tool;
+            }
+            events.push(Self::key(TouchKeyCode::BTN_TOUCH, 1));
+            self.device.emit(&events)?;
+            Ok(())
+        }
+
+        fn handle(&mut self, event: &DataTrackpadEvent) -> ResultType<()> {
+            match event.phase {
+                DataTrackpadPhase::Begin | DataTrackpadPhase::Update => self.update(&event.touches),
+                DataTrackpadPhase::End | DataTrackpadPhase::Cancel => self.release_all(),
+            }
+        }
+    }
+
+    impl Drop for VirtualTrackpad {
+        fn drop(&mut self) {
+            allow_err!(self.release_all());
+        }
+    }
+
+    #[cfg(test)]
+    mod virtual_trackpad_tests {
+        use super::*;
+
+        #[test]
+        fn scales_and_clamps_normalized_coordinates() {
+            assert_eq!(VirtualTrackpad::scale(-1, TRACKPAD_X_MAX), 0);
+            assert_eq!(VirtualTrackpad::scale(0, TRACKPAD_X_MAX), 0);
+            assert_eq!(VirtualTrackpad::scale(5_000, TRACKPAD_X_MAX), 2_000);
+            assert_eq!(
+                VirtualTrackpad::scale(TRACKPAD_COORD_MAX, TRACKPAD_X_MAX),
+                TRACKPAD_X_MAX
+            );
+            assert_eq!(
+                VirtualTrackpad::scale(TRACKPAD_COORD_MAX + 1, TRACKPAD_X_MAX),
+                TRACKPAD_X_MAX
+            );
+        }
+
+        #[test]
+        fn selects_linux_tool_count_keys() {
+            assert_eq!(VirtualTrackpad::tool_for_count(0), None);
+            assert_eq!(
+                VirtualTrackpad::tool_for_count(2),
+                Some(TouchKeyCode::BTN_TOOL_DOUBLETAP)
+            );
+            assert_eq!(
+                VirtualTrackpad::tool_for_count(3),
+                Some(TouchKeyCode::BTN_TOOL_TRIPLETAP)
+            );
+            assert_eq!(
+                VirtualTrackpad::tool_for_count(4),
+                Some(TouchKeyCode::BTN_TOOL_QUADTAP)
+            );
+            assert_eq!(VirtualTrackpad::tool_for_count(6), None);
+        }
+    }
 
     lazy_static::lazy_static! {
     static ref KEY_MAP: HashMap<enigo::Key, evdev::Key> = HashMap::from(
@@ -710,7 +954,11 @@ pub mod service {
         }
     }
 
-    fn handle_mouse(mouse: &mut mouce::UInputMouseManager, data: &DataMouse) {
+    fn handle_mouse(
+        mouse: &mut mouce::UInputMouseManager,
+        trackpad: &mut Option<VirtualTrackpad>,
+        data: &DataMouse,
+    ) {
         log::trace!("handle_mouse {:?}", &data);
         match data {
             DataMouse::MoveTo(x, y) => {
@@ -770,6 +1018,23 @@ pub mod service {
 
                 for _ in 0..length {
                     allow_err!(mouse.scroll_wheel(&scroll))
+                }
+            }
+            DataMouse::Trackpad(event) => {
+                if trackpad.is_none() {
+                    match VirtualTrackpad::new() {
+                        Ok(device) => {
+                            log::info!("UInput virtual trackpad created successfully");
+                            *trackpad = Some(device);
+                        }
+                        Err(err) => {
+                            log::error!("Failed to create UInput virtual trackpad: {}", err);
+                            return;
+                        }
+                    }
+                }
+                if let Some(trackpad) = trackpad {
+                    allow_err!(trackpad.handle(event));
                 }
             }
             DataMouse::Refresh => {
@@ -839,6 +1104,13 @@ pub mod service {
                     return;
                 }
             };
+            // The touchpad is created lazily by handle_mouse on the first
+            // trackpad event, so connections that never forward gestures do
+            // not expose an extra input device on the host. macOS clients
+            // prime that path with an empty cancel event as soon as gesture
+            // forwarding is enabled, giving udev/libinput and the compositor
+            // time to discover the device before the first real gesture.
+            let mut trackpad: Option<VirtualTrackpad> = None;
             loop {
                 tokio::select! {
                     res = stream.next() => {
@@ -869,7 +1141,7 @@ pub mod service {
                                                 }
                                             }
                                         } else {
-                                            handle_mouse(&mut mouse, &data);
+                                            handle_mouse(&mut mouse, &mut trackpad, &data);
                                         }
                                     }
                                     _ => {

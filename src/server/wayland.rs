@@ -1,8 +1,8 @@
 use super::*;
-use hbb_common::{allow_err, anyhow, platform::linux::DISTRO};
+use hbb_common::{allow_err, platform::linux::DISTRO};
 use scrap::{
     is_cursor_embedded, set_map_err,
-    wayland::pipewire::{fill_displays, try_fix_logical_size},
+    wayland::pipewire::{close_session, fill_displays, try_fix_logical_size},
     Capturer, Display, Frame, TraitCapturer,
 };
 use std::collections::HashMap;
@@ -10,15 +10,14 @@ use std::io;
 
 use crate::{
     client::{
-        SCRAP_OTHER_VERSION_OR_X11_REQUIRED, SCRAP_UBUNTU_HIGHER_REQUIRED,
-        SCRAP_X11_REQUIRED, SCRAP_XDP_PORTAL_UNAVAILABLE,
+        SCRAP_OTHER_VERSION_OR_X11_REQUIRED, SCRAP_UBUNTU_HIGHER_REQUIRED, SCRAP_X11_REQUIRED,
+        SCRAP_XDP_PORTAL_UNAVAILABLE,
     },
     platform::linux::is_x11,
 };
 
 lazy_static::lazy_static! {
     static ref CAP_DISPLAY_INFO: RwLock<HashMap<usize, u64>> = RwLock::new(HashMap::new());
-    static ref PIPEWIRE_INITIALIZED: RwLock<bool> = RwLock::new(false);
     static ref LOG_SCRAP_COUNT: Mutex<u32> = Mutex::new(0);
     static ref ACTIVE_DISPLAY_COUNT: RwLock<usize> = RwLock::new(0);
 }
@@ -107,6 +106,71 @@ struct CapDisplayInfo {
     capturer: CapturerPtr,
 }
 
+fn initialize_pipewire_capture(lock: &mut HashMap<usize, u64>) -> ResultType<()> {
+    let mut all = Display::all()?;
+    log::debug!("Initializing displays with fill_displays()");
+    {
+        let temp_mouse_move_handle = input_service::TemporaryMouseMoveHandle::new();
+        let move_mouse_to = |x, y| temp_mouse_move_handle.move_mouse_to(x, y);
+        fill_displays(move_mouse_to, crate::get_cursor_pos, &mut all)?;
+    }
+    log::debug!("Attempting to fix logical size with try_fix_logical_size()");
+    try_fix_logical_size(&mut all);
+
+    let num = all.len();
+    if num == 0 {
+        bail!("No PipeWire displays available");
+    }
+    let primary = super::display_service::get_primary_2(&all);
+    super::display_service::check_update_displays(&all);
+    let mut displays = super::display_service::get_sync_displays();
+    for display in displays.iter_mut() {
+        display.cursor_embedded = is_cursor_embedded();
+    }
+
+    let rects = all
+        .iter()
+        .map(|display| (display.origin(), display.width(), display.height()))
+        .collect::<Vec<_>>();
+
+    log::debug!(
+        "#displays={}, primary={}, rects: {:?}, cpus={}/{}",
+        num,
+        primary,
+        rects,
+        num_cpus::get_physical(),
+        num_cpus::get()
+    );
+
+    // Keep ownership local until every recorder is ready. A failed recorder
+    // must not leave a partial display map or a leaked PipeWire pipeline.
+    let mut pending = Vec::with_capacity(num);
+    for (idx, display) in all.into_iter().enumerate() {
+        let mut capturer = Box::new(
+            Capturer::new(display)
+                .with_context(|| format!("Failed to create capturer for display {}", idx))?,
+        );
+        let capturer_ptr = CapturerPtr(capturer.as_mut());
+        let cap_display_info = Box::new(CapDisplayInfo {
+            rects: rects.clone(),
+            displays: displays.clone(),
+            num,
+            primary,
+            current: idx,
+            capturer: capturer_ptr,
+        });
+        pending.push((idx, capturer, cap_display_info));
+    }
+
+    for (idx, capturer, cap_display_info) in pending {
+        let capturer_ptr = Box::into_raw(capturer);
+        debug_assert_eq!(capturer_ptr, cap_display_info.capturer.0);
+        lock.insert(idx, Box::into_raw(cap_display_info) as u64);
+    }
+
+    Ok(())
+}
+
 #[tokio::main(flavor = "current_thread")]
 pub(super) async fn ensure_inited() -> ResultType<()> {
     check_init().await
@@ -136,6 +200,11 @@ pub(super) fn is_inited() -> Option<Message> {
 pub(super) async fn check_init() -> ResultType<()> {
     if !is_x11() {
         if CAP_DISPLAY_INFO.read().unwrap().is_empty() {
+            // A connection-time output mode switch must settle before the portal
+            // snapshots the stream format. Starting both at once can stall Niri's
+            // PipeWire negotiation for tens of seconds.
+            hbb_common::tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
             if crate::input_service::wayland_use_uinput() {
                 if let Some((minx, maxx, miny, maxy)) =
                     scrap::wayland::display::get_desktop_rect_for_uinput()
@@ -157,62 +226,23 @@ pub(super) async fn check_init() -> ResultType<()> {
 
             let mut lock = CAP_DISPLAY_INFO.write().unwrap();
             if lock.is_empty() {
-                // Check if PipeWire is already initialized to prevent duplicate recorder creation
-                if *PIPEWIRE_INITIALIZED.read().unwrap() {
-                    log::warn!("wayland_diag: Preventing duplicate PipeWire initialization");
-                    return Ok(());
-                }
-
-                let mut all = Display::all()?;
-                log::debug!("Initializing displays with fill_displays()");
-                {
-                    let temp_mouse_move_handle = input_service::TemporaryMouseMoveHandle::new();
-                    let move_mouse_to = |x, y| temp_mouse_move_handle.move_mouse_to(x, y);
-                    fill_displays(move_mouse_to, crate::get_cursor_pos, &mut all)?;
-                }
-                log::debug!("Attempting to fix logical size with try_fix_logical_size()");
-                try_fix_logical_size(&mut all);
-                *PIPEWIRE_INITIALIZED.write().unwrap() = true;
-                let num = all.len();
-                let primary = super::display_service::get_primary_2(&all);
-                super::display_service::check_update_displays(&all);
-                let mut displays = super::display_service::get_sync_displays();
-                for display in displays.iter_mut() {
-                    display.cursor_embedded = is_cursor_embedded();
-                }
-
-                let mut rects: Vec<((i32, i32), usize, usize)> = Vec::new();
-                for d in &all {
-                    rects.push((d.origin(), d.width(), d.height()));
-                }
-
-                log::debug!(
-                    "#displays={}, primary={}, rects: {:?}, cpus={}/{}",
-                    num,
-                    primary,
-                    rects,
-                    num_cpus::get_physical(),
-                    num_cpus::get()
-                );
-
-                // Create individual CapDisplayInfo for each display with its own capturer
-                for (idx, display) in all.into_iter().enumerate() {
-                    let capturer =
-                        Box::into_raw(Box::new(Capturer::new(display).with_context(|| {
-                            format!("Failed to create capturer for display {}", idx)
-                        })?));
-                    let capturer = CapturerPtr(capturer);
-
-                    let cap_display_info = Box::into_raw(Box::new(CapDisplayInfo {
-                        rects: rects.clone(),
-                        displays: displays.clone(),
-                        num,
-                        primary,
-                        current: idx,
-                        capturer,
-                    }));
-
-                    lock.insert(idx, cap_display_info as u64);
+                for attempt in 1..=2 {
+                    match initialize_pipewire_capture(&mut lock) {
+                        Ok(()) => break,
+                        Err(err) => {
+                            // Discard the failed portal stream before retrying. In
+                            // particular, a mode switch can make the original
+                            // PipeWire node's negotiated format permanently stale.
+                            close_session();
+                            if attempt == 1 {
+                                log::warn!(
+                                    "Wayland capture initialization failed; retrying with a fresh PipeWire session: {err}"
+                                );
+                            } else {
+                                return Err(err);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -260,9 +290,6 @@ pub fn clear() {
         }
     }
     write_lock.clear();
-
-    // Reset PipeWire initialization flag to allow recreation on next init
-    *PIPEWIRE_INITIALIZED.write().unwrap() = false;
 }
 
 pub(super) fn get_capturer_for_display(

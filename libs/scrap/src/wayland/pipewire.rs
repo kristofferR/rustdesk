@@ -165,19 +165,31 @@ impl PipeWireCapturable {
         resolution: Arc<Mutex<Option<(usize, usize)>>>,
         stream: &PwStreamInfo,
     ) -> Self {
-        // alternative to get screen resolution as stream.size is not always correct ex: on fractional scaling
+        let stream_size_matches_display = get_displays()
+            .displays
+            .iter()
+            .any(|display| stream.size == (display.width as usize, display.height as usize));
+        // Avoid creating and tearing down a redundant GStreamer pipeline when the
+        // portal size already matches the compositor. PipeWire teardown with
+        // NVIDIA DMA-BUFs can otherwise block connection startup for ~10 seconds.
+        // Keep probing as a fallback for fractional scaling, where stream.size is
+        // not always the physical size:
         // https://github.com/rustdesk/rustdesk/issues/6116#issuecomment-1817724244
-        let physical_size = get_res(Self {
-            dbus_conn: conn.clone(),
-            fd: fd.clone(),
-            path: stream.path,
-            source_type: stream.source_type,
-            primary: false,
-            position: stream.position,
-            logical_size: stream.size,
-            physical_size: (0, 0),
-        })
-        .unwrap_or(stream.size);
+        let physical_size = if stream_size_matches_display {
+            stream.size
+        } else {
+            get_res(Self {
+                dbus_conn: conn.clone(),
+                fd: fd.clone(),
+                path: stream.path,
+                source_type: stream.source_type,
+                primary: false,
+                position: stream.position,
+                logical_size: stream.size,
+                physical_size: (0, 0),
+            })
+            .unwrap_or(stream.size)
+        };
         *resolution.lock().unwrap() = Some(physical_size);
         Self {
             dbus_conn: conn,

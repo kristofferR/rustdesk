@@ -378,6 +378,14 @@ pub fn close(id: i32) {
 }
 
 #[inline]
+#[cfg(not(any(target_os = "ios")))]
+pub fn close_all() {
+    for client in CLIENTS.read().unwrap().values() {
+        allow_err!(client.tx.send(Data::Close));
+    }
+}
+
+#[inline]
 pub fn remove(id: i32) {
     CLIENTS.write().unwrap().remove(&id);
 }
@@ -556,6 +564,10 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                 }
                                 Data::Close => {
                                     log::info!("cm ipc connection closed from connection request");
+                                    break;
+                                }
+                                Data::DisconnectAll => {
+                                    close_all();
                                     break;
                                 }
                                 Data::Disconnected => {

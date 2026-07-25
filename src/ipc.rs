@@ -329,6 +329,7 @@ pub enum Data {
     MouseMoveTime(i64),
     Authorize,
     Close,
+    DisconnectAll,
     #[cfg(windows)]
     SAS,
     UserSid(Option<u32>),

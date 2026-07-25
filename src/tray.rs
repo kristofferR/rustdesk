@@ -1,7 +1,7 @@
 use crate::client::translate;
 #[cfg(windows)]
 use crate::ipc::Data;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use hbb_common::tokio;
 use hbb_common::{allow_err, log};
 use std::sync::{Arc, Mutex};
@@ -65,9 +65,24 @@ fn make_tray() -> hbb_common::ResultType<()> {
         None
     };
     let open_i = MenuItem::new(translate("Open".to_owned()), true, None);
+    let disconnect_i = MenuItem::new(
+        translate("Disconnect all devices?".to_owned())
+            .trim_end_matches('?')
+            .to_owned(),
+        true,
+        None,
+    );
     if let Some(quit_i) = &quit_i {
+        #[cfg(target_os = "linux")]
+        tray_menu
+            .append_items(&[&open_i, &disconnect_i, quit_i])
+            .ok();
+        #[cfg(not(target_os = "linux"))]
         tray_menu.append_items(&[&open_i, quit_i]).ok();
     } else {
+        #[cfg(target_os = "linux")]
+        tray_menu.append_items(&[&open_i, &disconnect_i]).ok();
+        #[cfg(not(target_os = "linux"))]
         tray_menu.append_items(&[&open_i]).ok();
     }
     let tooltip = |count: usize| {
@@ -190,9 +205,13 @@ fn make_tray() -> hbb_common::ResultType<()> {
                     }
                 } else if event.id == open_i.id() {
                     open_func();
+                } else if event.id == disconnect_i.id() {
+                    disconnect_current_sessions();
                 }
             } else if event.id == open_i.id() {
                 open_func();
+            } else if event.id == disconnect_i.id() {
+                disconnect_current_sessions();
             }
         }
 
@@ -232,6 +251,24 @@ fn make_tray() -> hbb_common::ResultType<()> {
             }
         }
     });
+}
+
+fn disconnect_current_sessions() {
+    #[cfg(target_os = "linux")]
+    std::thread::spawn(disconnect_current_sessions_linux);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::main(flavor = "current_thread")]
+async fn disconnect_current_sessions_linux() {
+    match crate::ipc::connect(1_000, "_cm").await {
+        Ok(mut connection) => {
+            if let Err(err) = connection.send(&crate::ipc::Data::DisconnectAll).await {
+                log::error!("Failed to disconnect sessions: {err}");
+            }
+        }
+        Err(err) => log::error!("Failed to connect to the connection manager: {err}"),
+    }
 }
 
 #[cfg(windows)]
